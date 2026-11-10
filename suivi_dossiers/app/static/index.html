@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Suivi des dossiers</title>
+  <link rel="stylesheet" href="static/style.css?v=10">
+</head>
+<body>
+  <header class="topbar" id="topbar" hidden>
+    <a class="brand" href="#/">Suivi<span>Dossiers</span></a>
+    <nav class="main-nav">
+      <a href="#/" data-nav="dashboard">Tableau de bord</a>
+      <a href="#/dossiers" data-nav="dossiers">Dossiers</a>
+      <a href="#/users" data-nav="users">Utilisateurs</a>
+      <a href="#/dossiers/new" class="btn btn-primary btn-sm" data-nav="new">+ Nouveau dossier</a>
+    </nav>
+    <div class="userbox">
+      <span class="user-name" id="current-user"></span>
+      <button class="btn btn-ghost btn-sm" id="logout-btn" type="button">Déconnexion</button>
+    </div>
+  </header>
+
+  <main id="app" class="app"></main>
+
+  <script src="static/app.js?v=10"></script>
+</body>
+</html>

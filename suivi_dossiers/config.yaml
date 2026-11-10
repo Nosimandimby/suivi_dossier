@@ -1,0 +1,17 @@
+name: Suivi des dossiers
+version: "1.0.0"
+slug: suivi_dossiers
+description: Suivi et gestion des dossiers administratifs (accusés, retraits, visas) avec base SQLite persistante
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8000
+panel_icon: mdi:folder-account
+panel_title: Dossiers
+panel_admin: false
+map:
+  - type: share
+    read_only: true

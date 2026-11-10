@@ -1,0 +1,61 @@
+# ==========================================
+# 1. Environnements virtuels Python
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# 2. Fichiers de compilation Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 3. Distribution / Exécutables générés
+# ==========================================
+dist/
+construire-executable.exe
+construire-executable
+
+# ==========================================
+# 4. Données locales et logs (Spécifique à l'app)
+# ==========================================
+data/
+*.log
+*.sqlite
+*.db
+
+# ==========================================
+# 5. Fichiers de configuration locaux / Secrets
+# ==========================================
+.env
+# Si le dossier .freebuff contient des données locales ou du cache
+.freebuff/
+
+# ==========================================
+# 6. Système d'exploitation & IDE
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
