@@ -96,48 +96,6 @@ peut ensuite être copié seul sur n'importe quel PC Windows 64 bits, sans Pytho
 Pour reconstruire l'exécutable Linux : `bash construire-executable.sh`
 (nécessite `pyinstaller`, listé dans `requirements-dev.txt`).
 
-## Add-on Home Assistant
-
-L'application existe aussi sous forme d'**add-on Home Assistant**, avec base de
-données persistante sur la machine Home Assistant et interface intégrée dans la
-barre latérale (ingress). Le dossier `suivi_dossiers/` contient l'add-on
-(`config.yaml`, `Dockerfile`, `run.sh`, `DOCS.md`, icônes) et le fichier
-`repository.yaml` à la racine fait de ce projet un dépôt d'add-ons valide.
-Guide détaillé, avec dépannage : **[INSTALLATION-HA.md](INSTALLATION-HA.md)**.
-
-### Méthode 1 — installation locale (sans GitHub)
-
-1. Copiez le dossier **`suivi_dossiers/`** (pas toute l'application) dans le
-dossier `/addons` de Home Assistant — via l'add-on *Samba share*, *Advanced SSH
-& Web Terminal* ou l'éditeur de fichiers.
-2. Home Assistant → **Paramètres → Modules complémentaires → Boutique**.
-3. Menu (⋮) → **Vérifier les mises à jour**, puis installez **Suivi des
-dossiers**
-   (section *Modules complémentaires locaux*).
-4. Démarrez l'add-on : l'entrée **Dossiers** apparaît dans la barre latérale.
-
-### Méthode 2 — dépôt d'add-ons (mises à jour automatiques)
-
-Publiez ce dossier dans un dépôt Git (GitHub, Gitea…), puis dans Home
-Assistant : **Paramètres → Modules complémentaires → Boutique → ⋮ → Dépôts**,
-ajoutez l'URL du dépôt et installez l'add-on. Les mises à jour apparaîtront
-dans la boutique.
-
-### Données et sauvegardes
-
-- La base est **`/data/dossiers.db`** dans le volume privé de l'add-on : elle
-  survit aux mises à jour et elle est incluse dans les sauvegardes Home
-  Assistant.
-- Pour reprendre une base existante, déposez `dossiers.db` dans le dossier
-  partagé `/share` **avant le premier démarrage** : l'add-on l'importe
-  automatiquement (une seule fois).
-- Connexion initiale dans l'application : `admin` / `admin`.
-- Architectures : `amd64` et `aarch64` (Raspberry Pi 4/5, Green, Yellow, PC/VM).
-
-Après toute modification du code, relancez `./synchroniser-addon.sh` : il
-recopie `main.py`, `database.py`, `seed.py`, `chemins.py`, `requirements.txt` et
-`static/` dans `suivi_dossiers/app/`, seul dossier transmis au moteur de
-construction Docker par Home Assistant.
 
 ## Installation « développeur » (facultatif)
 
