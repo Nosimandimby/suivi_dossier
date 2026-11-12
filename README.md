@@ -237,9 +237,22 @@ L'onglet **Utilisateurs** permet de créer, modifier et supprimer des comptes :
 
 ---
 
-## 💾 Sauvegarde
+## 💾 Sauvegarde, import et réinitialisation
 
-Arrêtez l'application et copiez l'unique fichier de base :
+L'onglet **Données** de l'interface regroupe les trois opérations :
+
+- **Exporter** télécharge une copie complète de la base (`dossiers-AAAA-MM-JJ.db`) :
+  dossiers, remarques, utilisateurs et compteurs de numérotation. La copie est
+  prise par SQLite lui-même, elle est donc cohérente même sans arrêter l'application.
+- **Importer** remplace la base actuelle par un fichier `.db` exporté depuis
+  l'application. Le fichier est vérifié (format SQLite, intégrité, tables
+  attendues) et les bases d'une version antérieure sont mises à niveau. La
+  session est fermée : il faut se reconnecter avec un compte de la base importée.
+- **Réinitialiser** efface dossiers, remarques, comptes et compteurs, puis recrée
+  une base neuve avec le compte `admin` / `admin` et les points de contrôle.
+
+La base reste l'unique fichier `data/dossiers.db` : l'arrêter et copier ce fichier
+fonctionne aussi.
 ```bash
 cp data/dossiers.db data/dossiers-backup-$(date +%F).db
 ```
@@ -273,6 +286,10 @@ Toutes les routes sauf `POST /api/login` exigent `Authorization: Bearer <token>`
 | GET | `/api/dossiers/{id}/remarks` | remarques, plus récentes d'abord |
 | POST | `/api/dossiers/{id}/remarks` | ajouter une remarque (auteur = session) |
 | GET | `/api/dashboard` | compteurs par type/statut + activité récente |
+| GET | `/api/database/info` | emplacement, taille et volumes de la base |
+| GET | `/api/database/export` | télécharge une copie complète de la base (`.db`) |
+| POST | `/api/database/import` | remplace la base par un fichier `.db` envoyé en corps brut |
+| POST | `/api/database/reset` | remet la base à zéro (`admin` / `admin` + points de contrôle) |
 
 La documentation interactive de l'API est servie sur <http://127.0.0.1:8000/docs> (toujours hors ligne).
 

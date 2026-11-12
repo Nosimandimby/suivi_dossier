@@ -236,14 +236,18 @@ function renderError(err) {
 /* Authentification                                                   */
 /* ------------------------------------------------------------------ */
 
-function renderLogin(message) {
+function renderLogin(message, kind) {
   document.getElementById("topbar").hidden = true;
   document.getElementById("app").innerHTML = `
     <div class="auth-wrap">
       <form class="card auth-card" id="login-form">
         <h1>Suivi des dossiers</h1>
         <p class="muted">Connectez-vous pour continuer</p>
-        ${message ? `<div class="error">${esc(message)}</div>` : ""}
+        ${
+          message
+            ? `<div class="${kind === "notice" ? "notice" : "error"}">${esc(message)}</div>`
+            : ""
+        }
         <div class="field">
           <label for="login-identity">Identifiant</label>
           <input id="login-identity" name="identity" autocomplete="username" required>
@@ -1319,6 +1323,241 @@ async function renderUsers() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Données : export, import et réinitialisation de la base            */
+/* ------------------------------------------------------------------ */
+
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} o`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Ko`;
+  return `${(n / (1024 * 1024)).toFixed(1)} Mo`;
+}
+
+/* Téléchargement de la base : l'API exige le jeton Bearer, un simple lien ne
+   suffit donc pas. Le fichier est récupéré puis enregistré par le navigateur. */
+async function downloadDatabase(button) {
+  const errorBox = document.getElementById("export-error");
+  errorBox.hidden = true;
+  button.disabled = true;
+  try {
+    const res = await fetch(apiUrl("/api/database/export"), {
+      headers: { Authorization: "Bearer " + state.token },
+    });
+    if (res.status === 401) {
+      clearSession();
+      route("Votre session a expiré. Veuillez vous reconnecter.");
+      return;
+    }
+    if (!res.ok) {
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (err) {
+        /* corps vide */
+      }
+      throw new Error(detailMessage(data, res));
+    }
+    const blob = await res.blob();
+    const entete = res.headers.get("Content-Disposition") || "";
+    const trouve = /filename="?([^";]+)"?/.exec(entete);
+    const nom = trouve ? trouve[1] : "dossiers.db";
+    const url = URL.createObjectURL(blob);
+    const lien = document.createElement("a");
+    lien.href = url;
+    lien.download = nom;
+    document.body.appendChild(lien);
+    lien.click();
+    lien.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    if (err.message === "Session expirée") return;
+    errorBox.textContent = err.message;
+    errorBox.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* Envoi d'un fichier .db en corps brut (pas de multipart côté serveur). */
+async function uploadDatabase(fichier) {
+  const corps = await fichier.arrayBuffer();
+  const res = await fetch(apiUrl("/api/database/import"), {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + state.token,
+      "Content-Type": "application/octet-stream",
+    },
+    body: corps,
+  });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (err) {
+    /* corps vide */
+  }
+  if (res.status === 401) throw new Error("Session expirée");
+  if (!res.ok) throw new Error(detailMessage(data, res));
+  return data;
+}
+
+async function renderData() {
+  setActiveNav("data");
+  closePopovers();
+  const app = document.getElementById("app");
+  app.innerHTML = `<div class="page-head"><h1>Données</h1></div><p class="muted">Chargement…</p>`;
+  try {
+    const info = await api("/api/database/info");
+
+    app.innerHTML = `
+      <div class="page-head"><h1>Données</h1></div>
+
+      <section class="card">
+        <h2>Base actuelle</h2>
+        <div class="grid">
+          <div>
+            <span class="field-label">Fichier</span>
+            <span class="field-value small" style="word-break:break-all;">${esc(info.path)}</span>
+          </div>
+          <div>
+            <span class="field-label">Taille</span>
+            <span class="field-value">${esc(fmtSize(info.size_bytes))}</span>
+          </div>
+          <div>
+            <span class="field-label">Dossiers</span>
+            <span class="field-value">${info.dossiers}</span>
+          </div>
+          <div>
+            <span class="field-label">Utilisateurs</span>
+            <span class="field-value">${info.users}</span>
+          </div>
+          <div>
+            <span class="field-label">Remarques</span>
+            <span class="field-value">${info.remarks}</span>
+          </div>
+          <div>
+            <span class="field-label">Points de contrôle</span>
+            <span class="field-value">${info.checkpoints}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Exporter</h2>
+        <p class="muted">Télécharge une copie complète de la base (dossiers, remarques, utilisateurs, compteurs) dans un fichier <code>.db</code>. Conservez ce fichier : c'est votre sauvegarde.</p>
+        <div class="form-actions" style="justify-content:flex-start;">
+          <button class="btn btn-primary" id="export-btn" type="button">Télécharger la base (.db)</button>
+        </div>
+        <div class="error" id="export-error" hidden></div>
+      </section>
+
+      <section class="card">
+        <h2>Importer</h2>
+        <p class="muted">Restaure un fichier <code>.db</code> exporté depuis cette application. Toutes les données actuelles sont remplacées : exportez d'abord la base actuelle si vous voulez pouvoir revenir en arrière.</p>
+        <div class="field">
+          <label for="import-file">Fichier de sauvegarde (.db)</label>
+          <input id="import-file" type="file" accept=".db,.sqlite,.sqlite3">
+        </div>
+        <div class="error" id="import-error" hidden></div>
+        <div class="form-actions" style="justify-content:flex-start;">
+          <button class="btn btn-primary" id="import-btn" type="button">Importer et remplacer</button>
+        </div>
+        <p class="hint">Après l'import, la session est fermée : reconnectez-vous avec un compte présent dans la base importée.</p>
+      </section>
+
+      <section class="card">
+        <h2>Réinitialiser</h2>
+        <p class="muted">Efface définitivement tous les dossiers, remarques, comptes et compteurs, puis recrée une base neuve avec le compte <code>admin</code> / <code>admin</code> et les points de contrôle.</p>
+        <div class="field">
+          <label for="reset-confirm">Tapez <code>REINITIALISER</code> pour confirmer</label>
+          <input id="reset-confirm" autocomplete="off" placeholder="REINITIALISER">
+        </div>
+        <div class="error" id="reset-error" hidden></div>
+        <div class="form-actions" style="justify-content:flex-start;">
+          <button class="btn btn-danger" id="reset-btn" type="button" disabled>Réinitialiser la base</button>
+        </div>
+      </section>`;
+
+    /* --- Export ------------------------------------------------------ */
+    const exportBtn = document.getElementById("export-btn");
+    exportBtn.addEventListener("click", () => downloadDatabase(exportBtn));
+
+    /* --- Import ------------------------------------------------------ */
+    const importInput = document.getElementById("import-file");
+    const importBtn = document.getElementById("import-btn");
+    const importError = document.getElementById("import-error");
+    importBtn.addEventListener("click", async () => {
+      importError.hidden = true;
+      const fichier = importInput.files && importInput.files[0];
+      if (!fichier) {
+        importError.textContent = "Choisissez d'abord un fichier .db à importer.";
+        importError.hidden = false;
+        return;
+      }
+      if (
+        !window.confirm(
+          `Remplacer toutes les données actuelles par celles de « ${fichier.name} » ?`
+        )
+      )
+        return;
+      importBtn.disabled = true;
+      try {
+        const data = await uploadDatabase(fichier);
+        clearSession();
+        renderLogin(
+          `Base importée : ${data.dossiers} dossier(s), ${data.users} utilisateur(s). ` +
+            "Reconnectez-vous avec un compte présent dans cette base.",
+          "notice"
+        );
+      } catch (err) {
+        if (err.message === "Session expirée") {
+          clearSession();
+          route("Votre session a expiré. Veuillez vous reconnecter.");
+          return;
+        }
+        importError.textContent = err.message;
+        importError.hidden = false;
+        importBtn.disabled = false;
+      }
+    });
+
+    /* --- Réinitialisation -------------------------------------------- */
+    const resetInput = document.getElementById("reset-confirm");
+    const resetBtn = document.getElementById("reset-btn");
+    const resetError = document.getElementById("reset-error");
+    resetInput.addEventListener("input", () => {
+      resetBtn.disabled = resetInput.value.trim().toUpperCase() !== "REINITIALISER";
+    });
+    resetBtn.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          "Réinitialiser la base ? Tous les dossiers, remarques et comptes " +
+            "seront définitivement supprimés."
+        )
+      )
+        return;
+      resetError.hidden = true;
+      resetBtn.disabled = true;
+      try {
+        await api("/api/database/reset", { method: "POST", body: {} });
+        clearSession();
+        renderLogin(
+          "Base réinitialisée. Connectez-vous avec le compte par défaut admin / admin.",
+          "notice"
+        );
+      } catch (err) {
+        if (err.message === "Session expirée") return;
+        resetError.textContent = err.message;
+        resetError.hidden = false;
+        resetBtn.disabled = false;
+      }
+    });
+  } catch (err) {
+    if (err.message === "Session expirée") return;
+    renderError(err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Routeur                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1334,6 +1573,10 @@ function route(message) {
 
   if (parts[0] === "users") {
     renderUsers();
+    return;
+  }
+  if (parts[0] === "data") {
+    renderData();
     return;
   }
   if (parts[0] !== "dossiers" || parts.length === 0) {

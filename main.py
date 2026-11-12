@@ -11,9 +11,11 @@ import hmac
 import os
 import re
 import secrets
+import sqlite3
+import tempfile
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -947,6 +949,219 @@ def dashboard(user: dict = Depends(current_user)) -> dict:
         "by_status": by_status,
         "activity": activity[:15],
     }
+
+
+# ---------------------------------------------------------------------------
+# Base de données : export, import, réinitialisation
+# ---------------------------------------------------------------------------
+
+#: Taille maximale acceptée pour un fichier de base importé (512 Mo).
+IMPORT_MAX_BYTES = 512 * 1024 * 1024
+
+#: Tables qu'un fichier importé doit contenir pour être exploitable ici.
+REQUIRED_TABLES = ("users", "dossiers", "checkpoints", "counters", "remarks")
+
+
+def _data_directory() -> str:
+    """Dossier de la base, créé au besoin (fichiers temporaires d'échange)."""
+    dossier = os.path.dirname(db.DB_PATH) or "."
+    os.makedirs(dossier, exist_ok=True)
+    return dossier
+
+
+def _replace_database(source: str) -> None:
+    """Remplace atomiquement la base courante par le fichier ``source``.
+
+    Les connexions sont ouvertes le temps d'une requête (voir get_db) : aucun
+    fichier n'est donc maintenu ouvert entre deux appels.  Les fichiers annexes
+    SQLite (-journal, -wal, -shm) de l'ancienne base sont supprimés pour qu'ils
+    ne soient jamais rejoués sur la nouvelle.
+    """
+    for suffixe in ("-journal", "-wal", "-shm"):
+        annexe = db.DB_PATH + suffixe
+        if os.path.exists(annexe):
+            os.remove(annexe)
+    os.replace(source, db.DB_PATH)
+
+
+def _database_counts() -> dict:
+    with get_db() as conn:
+        return {
+            "users": conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"],
+            "dossiers": conn.execute(
+                "SELECT COUNT(*) AS n FROM dossiers WHERE deleted_at IS NULL"
+            ).fetchone()["n"],
+            "remarks": conn.execute("SELECT COUNT(*) AS n FROM remarks").fetchone()["n"],
+            "checkpoints": conn.execute(
+                "SELECT COUNT(*) AS n FROM checkpoints"
+            ).fetchone()["n"],
+        }
+
+
+def _snapshot_database() -> bytes:
+    """Copie cohérente de la base via l'API de sauvegarde SQLite.
+
+    L'instantané est pris par SQLite lui-même : il reste valide même si une
+    écriture a lieu au même moment, contrairement à une simple copie du fichier.
+    """
+    dossier = _data_directory()
+    descripteur, chemin = tempfile.mkstemp(
+        prefix="dossiers-export-", suffix=".db", dir=dossier
+    )
+    os.close(descripteur)
+    try:
+        with get_db() as conn:
+            destination = sqlite3.connect(chemin)
+            try:
+                conn.backup(destination)
+            finally:
+                destination.close()
+        with open(chemin, "rb") as fichier:
+            return fichier.read()
+    finally:
+        if os.path.exists(chemin):
+            os.unlink(chemin)
+
+
+def _validate_database_file(chemin: str) -> None:
+    """Refuse un fichier qui n'est pas une base exploitable par l'application."""
+    try:
+        conn = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
+    except sqlite3.Error:
+        raise HTTPException(
+            status_code=400, detail="Fichier illisible : ce n'est pas une base SQLite."
+        )
+    try:
+        try:
+            verif = conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError:
+            raise HTTPException(
+                status_code=400, detail="Fichier invalide : ce n'est pas une base SQLite."
+            )
+        if verif is None or verif[0] != "ok":
+            raise HTTPException(
+                status_code=400,
+                detail="Base corrompue : la vérification d'intégrité a échoué.",
+            )
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        manquantes = [t for t in REQUIRED_TABLES if t not in tables]
+        if manquantes:
+            raise HTTPException(
+                status_code=400,
+                detail="Ce fichier n'est pas une base de « Suivi des dossiers » "
+                "(tables manquantes : " + ", ".join(manquantes) + ").",
+            )
+    finally:
+        conn.close()
+
+
+@app.get("/api/database/info")
+def database_info(user: dict = Depends(current_user)) -> dict:
+    """Emplacement, taille et volumes de la base courante."""
+    infos = _database_counts()
+    try:
+        infos["size_bytes"] = os.path.getsize(db.DB_PATH)
+    except OSError:
+        infos["size_bytes"] = 0
+    infos["path"] = db.DB_PATH
+    return infos
+
+
+@app.get("/api/database/export")
+def export_database(user: dict = Depends(current_user)) -> Response:
+    """Télécharge une copie complète de la base (.db)."""
+    contenu = _snapshot_database()
+    nom = f"dossiers-{_today()}.db"
+    return Response(
+        content=contenu,
+        media_type="application/vnd.sqlite3",
+        headers={"Content-Disposition": f'attachment; filename="{nom}"'},
+    )
+
+
+@app.post("/api/database/import")
+async def import_database(
+    request: Request, user: dict = Depends(current_user)
+) -> dict:
+    """Remplace la base courante par un fichier .db envoyé dans le corps.
+
+    Le corps brut (application/octet-stream) est utilisé plutôt qu'un formulaire
+    multipart : aucune dépendance supplémentaire n'est ainsi nécessaire.
+    """
+    contenu = await request.body()
+    if not contenu:
+        raise HTTPException(status_code=400, detail="Aucun fichier reçu.")
+    if len(contenu) > IMPORT_MAX_BYTES:
+        raise HTTPException(
+            status_code=413, detail="Fichier trop volumineux (512 Mo maximum)."
+        )
+    if not contenu.startswith(b"SQLite format 3\x00"):
+        raise HTTPException(
+            status_code=400,
+            detail="Fichier invalide : ce n'est pas une base SQLite (.db).",
+        )
+
+    dossier = _data_directory()
+    descripteur, chemin = tempfile.mkstemp(
+        prefix="dossiers-import-", suffix=".db", dir=dossier
+    )
+    try:
+        with os.fdopen(descripteur, "wb") as fichier:
+            fichier.write(contenu)
+        _validate_database_file(chemin)
+        _replace_database(chemin)
+    except Exception:
+        if os.path.exists(chemin):
+            os.unlink(chemin)
+        raise
+
+    # Une base exportée par une version antérieure est mise à niveau, et le
+    # compte administrateur de secours est recréé s'il manque.
+    db.init_db()
+    seed.run()
+
+    resultat = _database_counts()
+    resultat.update({"ok": True, "reconnect": True})
+    return resultat
+
+
+@app.post("/api/database/reset")
+def reset_database(user: dict = Depends(current_user)) -> dict:
+    """Remet la base dans l'état d'un premier lancement (données effacées)."""
+    dossier = _data_directory()
+    descripteur, chemin = tempfile.mkstemp(
+        prefix="dossiers-reinit-", suffix=".db", dir=dossier
+    )
+    os.close(descripteur)
+    try:
+        # Une base neuve est construite à côté puis mise en place d'un seul coup :
+        # aucune fenêtre pendant laquelle la base serait absente ou incomplète.
+        conn = sqlite3.connect(chemin, isolation_level=None)
+        try:
+            conn.executescript(db.SCHEMA)
+            for dossier_type, rule in NUMBERING_RULES.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO counters (type, last_number) VALUES (?, ?)",
+                    (dossier_type, int(rule["start"]) - 1),
+                )
+        finally:
+            conn.close()
+        _replace_database(chemin)
+    except Exception:
+        if os.path.exists(chemin):
+            os.unlink(chemin)
+        raise
+
+    seed.run()  # compte admin/admin + catalogue des points de contrôle
+
+    resultat = _database_counts()
+    resultat.update({"ok": True, "reconnect": True})
+    return resultat
 
 
 # ---------------------------------------------------------------------------
