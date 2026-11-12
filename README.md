@@ -88,6 +88,61 @@ Lorsque vous modifiez le code sur votre machine de développement et que vous po
 
 ---
 
+## ⚙️ Lancement automatique en permanence (systemd)
+
+Par défaut, l'application s'arrête lorsque vous fermez le terminal. Si vous souhaitez qu'elle tourne en permanence en arrière-plan (par exemple sur un Raspberry Pi ou un serveur dédié), vous pouvez la configurer comme un service `systemd`.
+
+> ⚠️ **Note :** Dans ce mode, l'application ne tentera plus d'ouvrir le navigateur automatiquement. Vous devrez y accéder via l'adresse IP de la machine.
+
+### 1. Créer le fichier de service
+
+```bash
+sudo nano /etc/systemd/system/suivi-dossiers.service
+```
+
+### 2. Coller le contenu suivant
+
+*(Adaptez `User` et `WorkingDirectory` à votre configuration réelle)*
+
+```ini
+[Unit]
+Description=Suivi des dossiers (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=votre_utilisateur
+WorkingDirectory=/home/votre_utilisateur/suivi_dossier
+Environment="HOST=0.0.0.0"
+Environment="PORT=8000"
+# Démarrage direct sans le lanceur (les dépendances doivent être installées)
+ExecStart=/usr/bin/python3 main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 3. Activer et démarrer le service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable suivi-dossiers
+sudo systemctl start suivi-dossiers
+sudo systemctl status suivi-dossiers
+```
+
+### 4. Commandes utiles
+
+```bash
+sudo systemctl stop suivi-dossiers      # Arrêter le service
+sudo systemctl restart suivi-dossiers   # Redémarrer après une mise à jour
+sudo journalctl -u suivi-dossiers -f    # Voir les logs en temps réel
+```
+
+---
+
 ## 🛠 Installation « développeur » (Mode source)
 
 Pour modifier le code et bénéficier du rechargement à chaud :
@@ -245,5 +300,3 @@ suivi_dossiers/           add-on Home Assistant (config.yaml, Dockerfile, run.sh
 suivi_dossiers/app/       copie du code livrée à l'add-on (générée par synchroniser-addon.sh)
 synchroniser-addon.sh     recopie le code dans suivi_dossiers/app/
 ```
-```
-
