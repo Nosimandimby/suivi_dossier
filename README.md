@@ -229,6 +229,9 @@ L'onglet **Utilisateurs** permet de créer, modifier et supprimer des comptes :
 - Un compte désactivé ne peut plus se connecter (sessions coupées).
 - Suppression impossible pour son propre compte, ou pour un compte lié à des dossiers/remarques.
 - Un administrateur ne peut pas retirer son propre rôle (il perdrait l'accès à la gestion des comptes).
+- **Chaque utilisateur**, quel que soit son rôle, change son propre mot de passe avec le bouton
+  « Mot de passe » de l'en-tête : il saisit son mot de passe actuel et le nouveau (quatre caractères
+  minimum). L'identifiant reste définitif ; les autres comptes ne sont pas concernés.
 
 ### Rôles et permissions
 
@@ -281,6 +284,7 @@ Toutes les routes sauf `POST /api/login` exigent `Authorization: Bearer <token>`
 | POST | `/api/login` | connexion `{identity, password}` → `{token, user}` |
 | POST | `/api/logout` | invalide le jeton de session |
 | GET | `/api/me` | utilisateur courant |
+| PUT | `/api/me/password` | changer son propre mot de passe : `{current_password, new_password}` |
 | GET | `/api/meta` | types (plages + prochain numéro), états, statuts, rôles |
 | GET | `/api/users` | utilisateurs + nombre de dossiers |
 | POST | `/api/users` | créer un utilisateur |

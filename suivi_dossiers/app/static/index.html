@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Suivi des dossiers</title>
-  <link rel="stylesheet" href="static/style.css?v=12">
+  <link rel="stylesheet" href="static/style.css?v=13">
 </head>
 <body>
   <header class="topbar" id="topbar" hidden>
@@ -18,12 +18,44 @@
     </nav>
     <div class="userbox">
       <span class="user-name" id="current-user"></span>
+      <button class="btn btn-ghost btn-sm" id="password-btn" type="button">Mot de passe</button>
       <button class="btn btn-ghost btn-sm" id="logout-btn" type="button">Déconnexion</button>
     </div>
   </header>
 
   <main id="app" class="app"></main>
 
-  <script src="static/app.js?v=12"></script>
+  <!-- Panneau « Changer mon mot de passe », ouvert depuis l'en-tête. -->
+  <div id="password-panel" class="action-panel" hidden>
+    <form id="password-form">
+      <h3>Changer mon mot de passe</h3>
+      <div class="notice" id="password-ok" hidden></div>
+      <div class="error" id="password-error" hidden></div>
+      <div class="grid">
+        <div class="field">
+          <label for="pwd-current">Mot de passe actuel</label>
+          <input id="pwd-current" name="current_password" type="password"
+                 autocomplete="current-password" required>
+        </div>
+        <div class="field">
+          <label for="pwd-new">Nouveau mot de passe</label>
+          <input id="pwd-new" name="new_password" type="password" minlength="4"
+                 autocomplete="new-password" required>
+          <p class="hint">Quatre caractères minimum.</p>
+        </div>
+        <div class="field">
+          <label for="pwd-confirm">Confirmer le nouveau mot de passe</label>
+          <input id="pwd-confirm" name="confirm" type="password" minlength="4"
+                 autocomplete="new-password" required>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">Enregistrer</button>
+        <button class="btn" id="password-cancel" type="button">Annuler</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="static/app.js?v=13"></script>
 </body>
 </html>

@@ -325,6 +325,49 @@ def me(user: dict = Depends(current_user)) -> dict:
     return user
 
 
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=1, max_length=200)
+
+
+@app.put("/api/me/password")
+def change_my_password(
+    body: PasswordChangeIn, user: dict = Depends(current_user)
+) -> dict:
+    """Chaque utilisateur change son propre mot de passe.
+
+    Aucun rôle n'est requis : la modification ne porte que sur le compte de la
+    session, et le mot de passe actuel est demandé pour qu'une session laissée
+    ouverte ne suffise pas à verrouiller le compte.
+    """
+    nouveau = body.new_password
+    if len(nouveau) < 4:
+        raise HTTPException(
+            status_code=400,
+            detail="Le mot de passe doit contenir au moins 4 caractères",
+        )
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        if row is None or not verify_password(
+            body.current_password, row["password_hash"]
+        ):
+            raise HTTPException(
+                status_code=400, detail="Le mot de passe actuel est incorrect"
+            )
+        if body.current_password == nouveau:
+            raise HTTPException(
+                status_code=400,
+                detail="Le nouveau mot de passe doit être différent de l'actuel",
+            )
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (seed.hash_password(nouveau), user["id"]),
+        )
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Métadonnées de référence
 # ---------------------------------------------------------------------------

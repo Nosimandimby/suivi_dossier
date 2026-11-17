@@ -327,6 +327,62 @@ async function signOut() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Changer son propre mot de passe (tous les rôles)                    */
+/* ------------------------------------------------------------------ */
+
+function wirePasswordPanel() {
+  const panel = document.getElementById("password-panel");
+  const button = document.getElementById("password-btn");
+  const form = document.getElementById("password-form");
+  const cancel = document.getElementById("password-cancel");
+  if (!panel || !button || !form || !cancel) return;
+
+  const errorBox = document.getElementById("password-error");
+  const okBox = document.getElementById("password-ok");
+
+  button.addEventListener("click", () => {
+    errorBox.hidden = true;
+    okBox.hidden = true;
+    openPopover(panel, button);
+  });
+
+  cancel.addEventListener("click", closePopovers);
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const submit = form.querySelector("button[type=submit]");
+    errorBox.hidden = true;
+    okBox.hidden = true;
+
+    if (form.elements.new_password.value !== form.elements.confirm.value) {
+      errorBox.textContent = "Les deux nouveaux mots de passe ne correspondent pas.";
+      errorBox.hidden = false;
+      return;
+    }
+
+    submit.disabled = true;
+    try {
+      await api("/api/me/password", {
+        method: "PUT",
+        body: {
+          current_password: form.elements.current_password.value,
+          new_password: form.elements.new_password.value,
+        },
+      });
+      form.reset();
+      okBox.textContent = "Mot de passe modifié.";
+      okBox.hidden = false;
+    } catch (err) {
+      if (err.message === "Session expirée") return;
+      errorBox.textContent = err.message;
+      errorBox.hidden = false;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Tableau de bord                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -1674,6 +1730,7 @@ function route(message) {
 /* ------------------------------------------------------------------ */
 
 document.getElementById("logout-btn").addEventListener("click", signOut);
+wirePasswordPanel();
 window.addEventListener("hashchange", () => {
   state.usersEditId = null;
   route();
