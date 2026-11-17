@@ -228,6 +228,18 @@ L'onglet **Utilisateurs** permet de créer, modifier et supprimer des comptes :
 - L'identifiant est l'unique moyen de connexion et devient définitif.
 - Un compte désactivé ne peut plus se connecter (sessions coupées).
 - Suppression impossible pour son propre compte, ou pour un compte lié à des dossiers/remarques.
+- Un administrateur ne peut pas retirer son propre rôle (il perdrait l'accès à la gestion des comptes).
+
+### Rôles et permissions
+
+| Rôle | Droits |
+|------|--------|
+| `admin` | Tout : dossiers, remarques, comptes, import et réinitialisation de la base. |
+| `Vérificateur` | Tout sauf la gestion des utilisateurs et la réinitialisation de la base. |
+| `Délégué` | Consultation seule : listes, fiches, tableau de bord, remarques, export. Aucune création, modification, suppression, remarque, import ni réinitialisation. |
+
+L'interface masque les actions interdites, mais les droits sont **vérifiés par le serveur** :
+une requête non autorisée renvoie `403`, même si elle est envoyée directement à l'API.
 
 ---
 

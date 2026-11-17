@@ -30,6 +30,9 @@ from database import (
     DOSSIER_STATUSES,
     DOSSIER_TYPES,
     NUMBERING_RULES,
+    ROLE_ADMIN,
+    ROLE_DELEGUE,
+    ROLE_VERIFICATEUR,
     USER_ROLES,
     get_db,
 )
@@ -137,6 +140,44 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
             status_code=401, detail="Session expirée, veuillez vous reconnecter"
         )
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Rôles et permissions
+# ---------------------------------------------------------------------------
+#
+# - admin        : tout (dossiers, comptes, import, réinitialisation)
+# - Vérificateur : tout sauf la gestion des comptes et la réinitialisation
+# - Délégué      : consultation seule, aucune écriture
+#
+# Les droits sont vérifiés ici, côté serveur : masquer un bouton dans
+# l'interface ne protège rien.
+
+
+def is_admin(user: dict) -> bool:
+    return user["role"] == ROLE_ADMIN
+
+
+def can_write(user: dict) -> bool:
+    """Un délégué lit seulement ; les autres rôles peuvent modifier les données."""
+    return user["role"] in (ROLE_ADMIN, ROLE_VERIFICATEUR)
+
+
+def require_admin(user: dict = Depends(current_user)) -> dict:
+    if not is_admin(user):
+        raise HTTPException(
+            status_code=403, detail="Action réservée à l'administrateur."
+        )
+    return user
+
+
+def require_write(user: dict = Depends(current_user)) -> dict:
+    if not can_write(user):
+        raise HTTPException(
+            status_code=403,
+            detail="Votre rôle « Délégué » permet seulement la consultation.",
+        )
+    return user
 
 
 def _user_out(row) -> dict:
@@ -309,6 +350,9 @@ def meta(user: dict = Depends(current_user)) -> dict:
         "states": DOSSIER_STATES,
         "default_state": DEFAULT_STATE,
         "roles": USER_ROLES,
+        # Droits du compte connecté : l'interface s'en sert pour masquer les
+        # actions interdites, le serveur les vérifie de son côté.
+        "permissions": {"admin": is_admin(user), "write": can_write(user)},
     }
 
 
@@ -356,7 +400,7 @@ def list_users(user: dict = Depends(current_user)) -> list[dict]:
 
 
 @app.post("/api/users", status_code=201)
-def create_user(body: UserIn, user: dict = Depends(current_user)) -> dict:
+def create_user(body: UserIn, user: dict = Depends(require_admin)) -> dict:
     username = body.username.strip()
     if not USERNAME_RE.match(username):
         raise HTTPException(
@@ -393,7 +437,7 @@ def create_user(body: UserIn, user: dict = Depends(current_user)) -> dict:
 
 @app.put("/api/users/{user_id}")
 def update_user(
-    user_id: int, body: UserPatch, user: dict = Depends(current_user)
+    user_id: int, body: UserPatch, user: dict = Depends(require_admin)
 ) -> dict:
     data = body.model_dump(exclude_unset=True)
     with get_db() as conn:
@@ -412,6 +456,11 @@ def update_user(
         role = existing["role"]
         if "role" in data:
             role = _require_role(data["role"])
+            if user_id == user["id"] and role != ROLE_ADMIN:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Vous ne pouvez pas retirer votre propre rôle administrateur",
+                )
 
         actif = existing["actif"]
         if "actif" in data:
@@ -443,7 +492,7 @@ def update_user(
 
 
 @app.delete("/api/users/{user_id}")
-def delete_user(user_id: int, user: dict = Depends(current_user)) -> dict:
+def delete_user(user_id: int, user: dict = Depends(require_admin)) -> dict:
     if user_id == user["id"]:
         raise HTTPException(
             status_code=400, detail="Vous ne pouvez pas supprimer votre propre compte"
@@ -545,7 +594,7 @@ def list_dossiers(
 
 
 @app.post("/api/dossiers", status_code=201)
-def create_dossier(body: DossierIn, user: dict = Depends(current_user)) -> dict:
+def create_dossier(body: DossierIn, user: dict = Depends(require_write)) -> dict:
     """Crée un dossier.
 
     Le numéro de référence est attribué à partir du compteur persistant de son
@@ -625,7 +674,7 @@ def get_dossier(dossier_id: int, user: dict = Depends(current_user)) -> dict:
 
 @app.put("/api/dossiers/{dossier_id}")
 def update_dossier(
-    dossier_id: int, body: DossierPatch, user: dict = Depends(current_user)
+    dossier_id: int, body: DossierPatch, user: dict = Depends(require_write)
 ) -> dict:
     data = body.model_dump(exclude_unset=True)
     with get_db() as conn:
@@ -734,7 +783,7 @@ def _existing_dossier(conn, dossier_id: int):
 
 @app.post("/api/dossiers/{dossier_id}/withdraw")
 def withdraw_dossier(
-    dossier_id: int, body: WithdrawIn, user: dict = Depends(current_user)
+    dossier_id: int, body: WithdrawIn, user: dict = Depends(require_write)
 ) -> dict:
     """Passe le dossier à l'état « Retiré » en enregistrant qui l'a retiré."""
     withdrawn_by = body.withdrawn_by.strip()
@@ -760,7 +809,7 @@ def withdraw_dossier(
 
 @app.post("/api/dossiers/{dossier_id}/receive")
 def receive_dossier(
-    dossier_id: int, body: ReceiveIn, user: dict = Depends(current_user)
+    dossier_id: int, body: ReceiveIn, user: dict = Depends(require_write)
 ) -> dict:
     """Remet le dossier à l'état « Reçu » et efface la date de retrait."""
     with get_db() as conn:
@@ -777,7 +826,7 @@ def receive_dossier(
 
 @app.post("/api/dossiers/{dossier_id}/status")
 def change_dossier_status(
-    dossier_id: int, body: StatusChangeIn, user: dict = Depends(current_user)
+    dossier_id: int, body: StatusChangeIn, user: dict = Depends(require_write)
 ) -> dict:
     """Change le statut (En cours / Visé / Rejeté) avec remarque facultative."""
     status = _require_status(body.status)
@@ -793,7 +842,7 @@ def change_dossier_status(
 
 
 @app.delete("/api/dossiers/{dossier_id}")
-def delete_dossier(dossier_id: int, user: dict = Depends(current_user)) -> dict:
+def delete_dossier(dossier_id: int, user: dict = Depends(require_write)) -> dict:
     """Suppression logique : la ligne reste en base, horodatée par deleted_at."""
     with get_db() as conn:
         existing = conn.execute(
@@ -836,7 +885,7 @@ def list_remarks(dossier_id: int, user: dict = Depends(current_user)) -> list[di
 
 @app.post("/api/dossiers/{dossier_id}/remarks", status_code=201)
 def add_remark(
-    dossier_id: int, body: RemarkIn, user: dict = Depends(current_user)
+    dossier_id: int, body: RemarkIn, user: dict = Depends(require_write)
 ) -> dict:
     text = body.comment_text.strip()
     if not text:
@@ -1086,7 +1135,7 @@ def export_database(user: dict = Depends(current_user)) -> Response:
 
 @app.post("/api/database/import")
 async def import_database(
-    request: Request, user: dict = Depends(current_user)
+    request: Request, user: dict = Depends(require_write)
 ) -> dict:
     """Remplace la base courante par un fichier .db envoyé dans le corps.
 
@@ -1131,7 +1180,7 @@ async def import_database(
 
 
 @app.post("/api/database/reset")
-def reset_database(user: dict = Depends(current_user)) -> dict:
+def reset_database(user: dict = Depends(require_admin)) -> dict:
     """Remet la base dans l'état d'un premier lancement (données effacées)."""
     dossier = _data_directory()
     descripteur, chemin = tempfile.mkstemp(

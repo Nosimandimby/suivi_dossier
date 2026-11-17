@@ -52,9 +52,14 @@ DOSSIER_STATUSES = ["En cours", "Visé", "Rejeté", "Retour"]
 DOSSIER_STATES = ["Reçu", "Retiré"]
 DEFAULT_STATUS = "En cours"
 DEFAULT_STATE = "Reçu"
-# Rôles disponibles.  Le MVP n'expose que le rôle administrateur, mais la
-# colonne existe pour les rôles à venir.
-USER_ROLES = ["admin"]
+# Rôles disponibles.  L'administrateur fait tout ; le vérificateur fait tout
+# sauf gérer les comptes et réinitialiser la base ; le délégué consulte
+# seulement.  Les droits sont appliqués par le serveur (voir main.py), jamais
+# uniquement par l'interface.
+ROLE_ADMIN = "admin"
+ROLE_VERIFICATEUR = "Vérificateur"
+ROLE_DELEGUE = "Délégué"
+USER_ROLES = [ROLE_ADMIN, ROLE_VERIFICATEUR, ROLE_DELEGUE]
 
 
 def format_reference(number: int) -> str:

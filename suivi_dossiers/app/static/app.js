@@ -4,6 +4,9 @@
 
 const TOKEN_KEY = "dossiertrack_token";
 const USERS_PATH = "#/users";
+const ROLE_HINT =
+  "admin : tout · Vérificateur : tout sauf les comptes et la réinitialisation " +
+  "· Délégué : consultation seule";
 
 /* Préfixe du chemin où l'application est servie.  Sous Home Assistant, la page
    vit dans /api/hassio_ingress/<jeton>/ : les appels API doivent donc être
@@ -179,6 +182,21 @@ function clearSession() {
   localStorage.removeItem(TOKEN_KEY);
 }
 
+/* Permissions des rôles : le serveur les fait respecter, l'interface les utilise
+   pour masquer ce qui est interdit.
+   - admin        : tout
+   - Vérificateur : tout sauf les comptes et la réinitialisation de la base
+   - Délégué      : consultation seule */
+function isAdmin() {
+  if (state.meta && state.meta.permissions) return !!state.meta.permissions.admin;
+  return !!(state.user && state.user.role === "admin");
+}
+
+function canWrite() {
+  if (state.meta && state.meta.permissions) return !!state.meta.permissions.write;
+  return !!(state.user && state.user.role !== "Délégué");
+}
+
 async function api(path, options = {}) {
   const method = options.method || "GET";
   const hadToken = !!state.token;
@@ -219,6 +237,12 @@ function showAppChrome() {
   document.getElementById("current-user").textContent = state.user
     ? state.user.display_name
     : "";
+  /* Les comptes se gèrent en tant qu'administrateur ; un délégué ne saisit
+     aucun dossier. */
+  const usersNav = document.querySelector('.main-nav a[data-nav="users"]');
+  if (usersNav) usersNav.style.display = isAdmin() ? "" : "none";
+  const newNav = document.querySelector('.main-nav a[data-nav="new"]');
+  if (newNav) newNav.style.display = canWrite() ? "" : "none";
 }
 
 function setActiveNav(name) {
@@ -475,11 +499,15 @@ async function renderList() {
             <td>${esc(d.verifier_name)}</td>
             <td>${esc(fmtDate(d.created_date))}</td>
             <td>${esc(fmtDate(d.withdrawal_date))}</td>
-            <td>
+            ${
+              canWrite()
+                ? `<td>
               <div class="row-actions">
                 <button class="btn btn-sm btn-danger" data-del-dossier="${d.id}" type="button">Supprimer</button>
               </div>
-            </td>
+            </td>`
+                : ""
+            }
           </tr>`
       )
       .join("");
@@ -487,7 +515,11 @@ async function renderList() {
     app.innerHTML = `
       <div class="page-head">
         <h1>Dossiers</h1>
-        <a class="btn btn-primary" href="#/dossiers/new">+ Nouveau dossier</a>
+        ${
+          canWrite()
+            ? `<a class="btn btn-primary" href="#/dossiers/new">+ Nouveau dossier</a>`
+            : ""
+        }
       </div>
 
       <div class="card">
@@ -524,16 +556,20 @@ async function renderList() {
             <thead>
               <tr>
                 <th>Référence</th><th>Nom</th><th>Type</th><th>État</th><th>Statut</th>
-                <th>Vérificateur</th><th>Date du dossier</th><th>Date de retrait</th><th>Actions</th>
+                <th>Vérificateur</th><th>Date du dossier</th><th>Date de retrait</th>${
+                  canWrite() ? "<th>Actions</th>" : ""
+                }
               </tr>
             </thead>
             <tbody>
               ${
                 rows ||
-                `<tr><td colspan="9" class="empty">Aucun dossier ne correspond aux filtres actuels.</td></tr>`
+                `<tr><td colspan="${
+                  canWrite() ? 9 : 8
+                }" class="empty">Aucun dossier ne correspond aux filtres actuels.</td></tr>`
               }
               <tr id="f-empty" hidden>
-                <td colspan="9" class="empty">Aucun dossier ne correspond à la recherche.</td>
+                <td colspan="${canWrite() ? 9 : 8}" class="empty">Aucun dossier ne correspond à la recherche.</td>
               </tr>
             </tbody>
           </table>
@@ -649,6 +685,7 @@ async function renderDetail(id) {
   closePopovers();
   const app = document.getElementById("app");
   app.innerHTML = `<p class="muted">Chargement…</p>`;
+  const peutModifier = canWrite();
   try {
     const [d, remarks] = await Promise.all([
       api(`/api/dossiers/${id}`),
@@ -673,8 +710,12 @@ async function renderDetail(id) {
           <div style="display:flex;gap:8px;align-items:center;">
             ${stateBadge(d.state)}
             ${statusBadge(d.status)}
-            <a class="btn btn-sm" href="#/dossiers/${d.id}/edit">Modifier</a>
-            <button class="btn btn-sm btn-danger" id="detail-delete" type="button">Supprimer</button>
+            ${
+              peutModifier
+                ? `<a class="btn btn-sm" href="#/dossiers/${d.id}/edit">Modifier</a>
+            <button class="btn btn-sm btn-danger" id="detail-delete" type="button">Supprimer</button>`
+                : ""
+            }
           </div>
         </div>
 
@@ -693,16 +734,24 @@ async function renderDetail(id) {
             <span class="field-label">État</span>
             <span class="field-value">
               ${stateBadge(d.state)}
-              <button class="btn btn-sm" id="toggle-retire" type="button">${
-                d.state === "Retiré" ? "Annuler le retrait" : "Retirer"
-              }</button>
+              ${
+                peutModifier
+                  ? `<button class="btn btn-sm" id="toggle-retire" type="button">${
+                      d.state === "Retiré" ? "Annuler le retrait" : "Retirer"
+                    }</button>`
+                  : ""
+              }
             </span>
           </div>
           <div>
             <span class="field-label">Statut</span>
             <span class="field-value">
               ${statusBadge(d.status)}
-              <button class="btn btn-sm" id="toggle-status" type="button">Changer le statut</button>
+              ${
+                peutModifier
+                  ? `<button class="btn btn-sm" id="toggle-status" type="button">Changer le statut</button>`
+                  : ""
+              }
             </span>
           </div>
           <div>
@@ -795,7 +844,9 @@ async function renderDetail(id) {
 
       <section class="card">
         <h2>Remarques</h2>
-        <form id="remark-form">
+        ${
+          peutModifier
+            ? `<form id="remark-form">
           <div class="field">
             <label for="r-text">Ajouter une remarque</label>
             <textarea id="r-text" name="comment_text" placeholder="Observation, constat, note…" required></textarea>
@@ -804,11 +855,13 @@ async function renderDetail(id) {
             <button class="btn btn-primary" type="submit">Ajouter la remarque</button>
           </div>
           <div class="error" id="remark-error" hidden></div>
-        </form>
+        </form>`
+            : `<p class="hint">Consultation seule : l'ajout de remarque est réservé aux vérificateurs.</p>`
+        }
         <div id="remarks-container">${remarkList(remarks)}</div>
       </section>`;
 
-    document.getElementById("detail-delete").addEventListener("click", async () => {
+    document.getElementById("detail-delete")?.addEventListener("click", async () => {
       if (!window.confirm(`Supprimer le dossier ${d.reference_number} ?`)) return;
       try {
         await api(`/api/dossiers/${d.id}`, { method: "DELETE" });
@@ -821,7 +874,7 @@ async function renderDetail(id) {
 
     document
       .getElementById("remark-form")
-      .addEventListener("submit", async (ev) => {
+      ?.addEventListener("submit", async (ev) => {
         ev.preventDefault();
         const form = ev.target;
         const errorBox = document.getElementById("remark-error");
@@ -846,7 +899,7 @@ async function renderDetail(id) {
     const retirePanel = document.getElementById("retire-panel");
     const statusPanel = document.getElementById("status-panel");
 
-    document.getElementById("toggle-retire").addEventListener("click", async () => {
+    document.getElementById("toggle-retire")?.addEventListener("click", async () => {
       if (d.state === "Retiré") {
         if (!window.confirm(`Remettre le dossier ${d.reference_number} à l'état « Reçu » ?`)) return;
         try {
@@ -888,7 +941,7 @@ async function renderDetail(id) {
     });
 
     /* --- Changement de statut ---------------------------------------- */
-    document.getElementById("toggle-status").addEventListener("click", () => {
+    document.getElementById("toggle-status")?.addEventListener("click", () => {
       openPopover(statusPanel, document.getElementById("toggle-status"));
     });
 
@@ -930,6 +983,12 @@ async function renderDetail(id) {
 async function renderForm(id) {
   setActiveNav(id ? "dossiers" : "new");
   const app = document.getElementById("app");
+  if (!canWrite()) {
+    app.innerHTML = `
+      <div class="breadcrumb"><a href="#/dossiers">← Tous les dossiers</a></div>
+      <div class="notice">Votre rôle permet seulement la consultation : la création et la modification des dossiers sont réservées aux vérificateurs et à l'administrateur.</div>`;
+    return;
+  }
   app.innerHTML = `<p class="muted">Chargement…</p>`;
   try {
     const isEdit = id != null;
@@ -1130,6 +1189,7 @@ function userFormHtml(editing) {
           <div class="field">
             <label for="u-role">Rôle</label>
             <select id="u-role" name="role">${roleOptions(editing.role)}</select>
+            <p class="hint">${ROLE_HINT}</p>
           </div>
           <div class="field">
             <label for="u-password">Nouveau mot de passe (facultatif)</label>
@@ -1172,6 +1232,7 @@ function userFormHtml(editing) {
           <div class="field">
             <label for="u-role">Rôle</label>
             <select id="u-role" name="role">${roleOptions("admin")}</select>
+            <p class="hint">${ROLE_HINT}</p>
           </div>
           <div class="field">
             <label class="check-line" for="u-actif">
@@ -1189,6 +1250,11 @@ function userFormHtml(editing) {
 async function renderUsers() {
   setActiveNav("users");
   const app = document.getElementById("app");
+  if (!isAdmin()) {
+    app.innerHTML = `<div class="page-head"><h1>Utilisateurs</h1></div>
+      <div class="notice">La gestion des utilisateurs est réservée à l'administrateur.</div>`;
+    return;
+  }
   app.innerHTML = `<div class="page-head"><h1>Utilisateurs</h1></div><p class="muted">Chargement…</p>`;
   try {
     const users = await api("/api/users");
@@ -1450,7 +1516,7 @@ async function renderData() {
         <div class="error" id="export-error" hidden></div>
       </section>
 
-      <section class="card">
+      <section class="card" ${canWrite() ? "" : "hidden"}>
         <h2>Importer</h2>
         <p class="muted">Restaure un fichier <code>.db</code> exporté depuis cette application. Toutes les données actuelles sont remplacées : exportez d'abord la base actuelle si vous voulez pouvoir revenir en arrière.</p>
         <div class="field">
@@ -1464,7 +1530,7 @@ async function renderData() {
         <p class="hint">Après l'import, la session est fermée : reconnectez-vous avec un compte présent dans la base importée.</p>
       </section>
 
-      <section class="card">
+      <section class="card" ${isAdmin() ? "" : "hidden"}>
         <h2>Réinitialiser</h2>
         <p class="muted">Efface définitivement tous les dossiers, remarques, comptes et compteurs, puis recrée une base neuve avec le compte <code>admin</code> / <code>admin</code> et les points de contrôle.</p>
         <div class="field">
