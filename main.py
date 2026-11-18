@@ -35,6 +35,7 @@ from database import (
     ROLE_VERIFICATEUR,
     USER_ROLES,
     get_db,
+    get_users_db,
 )
 
 BASE_DIR = chemins.HOME_DIR
@@ -43,14 +44,13 @@ SESSION_DAYS = 30
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{2,50}$")
 
+# Les comptes étant dans une autre base, le vérificateur n'est plus joint :
+# son identifiant est résolu en nom par _user_names().
 DOSSIER_SELECT = """
     SELECT d.*,
-           u.display_name AS verifier_name,
-           u.username     AS verifier_username,
            p.reference_number AS parent_reference,
            p.name             AS parent_name
     FROM dossiers d
-    JOIN users u ON u.id = d.verifier_id
     LEFT JOIN dossiers p ON p.id = d.parent_dossier_id
 """
 
@@ -128,7 +128,8 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Non connecté")
     token = authorization[7:].strip()
-    with get_db() as conn:
+    # Comptes et sessions vivent dans leur propre base.
+    with get_users_db() as conn:
         row = conn.execute(
             "SELECT u.id, u.username, u.display_name, u.role, u.actif "
             "FROM sessions s JOIN users u ON u.id = s.user_id "
@@ -197,18 +198,36 @@ def _checkpoint_out(row) -> dict:
     }
 
 
-def _remark_out(row) -> dict:
+def _remark_out(row, author_name: str) -> dict:
     return {
         "id": row["id"],
         "dossier_id": row["dossier_id"],
         "comment_text": row["comment_text"],
         "author_id": row["author_id"],
-        "author_name": row["author_name"],
+        "author_name": author_name,
         "date": row["date"],
     }
 
 
-def _dossier_out(row) -> dict:
+def _user_names(ids) -> dict[int, str]:
+    """Noms affichés des comptes, lus dans la base des utilisateurs.
+
+    Les deux bases n'ont aucune jointure commune : les identifiants stockés
+    dans les dossiers et les remarques sont résolus ici, en une requête.
+    """
+    ids = {int(i) for i in ids if i is not None}
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" * len(ids))
+    with get_users_db() as conn:
+        rows = conn.execute(
+            f"SELECT id, display_name FROM users WHERE id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+    return {row["id"]: row["display_name"] for row in rows}
+
+
+def _dossier_out(row, verifier_name: str) -> dict:
     keys = row.keys()
     return {
         "id": row["id"],
@@ -225,11 +244,20 @@ def _dossier_out(row) -> dict:
         "updated_at": row["updated_at"],
         "deleted_at": row["deleted_at"],
         "verifier_id": row["verifier_id"],
-        "verifier_name": row["verifier_name"],
+        "verifier_name": verifier_name,
         "parent_dossier_id": row["parent_dossier_id"],
         "parent_reference": row["parent_reference"] if "parent_reference" in keys else None,
         "parent_name": row["parent_name"] if "parent_name" in keys else None,
     }
+
+
+def _dossiers_out(rows) -> list[dict]:
+    noms = _user_names({row["verifier_id"] for row in rows})
+    return [_dossier_out(row, noms.get(row["verifier_id"], "—")) for row in rows]
+
+
+def _dossier_single_out(row) -> dict:
+    return _dossiers_out([row])[0]
 
 
 def _require_type(value: str) -> str:
@@ -290,7 +318,7 @@ class LoginIn(BaseModel):
 @app.post("/api/login")
 def login(body: LoginIn) -> dict:
     identity = body.identity.strip()
-    with get_db() as conn:
+    with get_users_db() as conn:
         row = conn.execute(
             "SELECT * FROM users WHERE username = ?",
             (identity,),
@@ -313,7 +341,7 @@ def login(body: LoginIn) -> dict:
 @app.post("/api/logout")
 def logout(authorization: str | None = Header(default=None)) -> dict:
     if authorization and authorization.startswith("Bearer "):
-        with get_db() as conn:
+        with get_users_db() as conn:
             conn.execute(
                 "DELETE FROM sessions WHERE token = ?", (authorization[7:].strip(),)
             )
@@ -346,7 +374,7 @@ def change_my_password(
             status_code=400,
             detail="Le mot de passe doit contenir au moins 4 caractères",
         )
-    with get_db() as conn:
+    with get_users_db() as conn:
         row = conn.execute(
             "SELECT password_hash FROM users WHERE id = ?", (user["id"],)
         ).fetchone()
@@ -426,20 +454,36 @@ def _require_role(value: str) -> str:
 
 
 USER_SELECT = """
-    SELECT u.id, u.username, u.display_name, u.role, u.actif, u.created_at,
-           (SELECT COUNT(*) FROM dossiers d
-             WHERE d.verifier_id = u.id AND d.deleted_at IS NULL) AS dossier_count
+    SELECT u.id, u.username, u.display_name, u.role, u.actif, u.created_at
     FROM users u
 """
 
 
+def _dossier_counts_by_user() -> dict[int, int]:
+    """Nombre de dossiers actifs par vérificateur (base des dossiers)."""
+    with get_db() as conn:
+        return {
+            row["verifier_id"]: row["n"]
+            for row in conn.execute(
+                "SELECT verifier_id, COUNT(*) AS n FROM dossiers "
+                "WHERE deleted_at IS NULL GROUP BY verifier_id"
+            )
+        }
+
+
 @app.get("/api/users")
 def list_users(user: dict = Depends(current_user)) -> list[dict]:
-    with get_db() as conn:
+    with get_users_db() as conn:
         rows = conn.execute(
             USER_SELECT + " ORDER BY u.display_name COLLATE NOCASE"
         ).fetchall()
-    return [_user_out(r) for r in rows]
+    counts = _dossier_counts_by_user()
+    result = []
+    for row in rows:
+        item = _user_out(row)
+        item["dossier_count"] = counts.get(row["id"], 0)
+        result.append(item)
+    return result
 
 
 @app.post("/api/users", status_code=201)
@@ -454,7 +498,7 @@ def create_user(body: UserIn, user: dict = Depends(require_admin)) -> dict:
     if not display_name:
         raise HTTPException(status_code=400, detail="Le nom affiché est obligatoire")
     role = _require_role(body.role)
-    with get_db() as conn:
+    with get_users_db() as conn:
         clash = conn.execute(
             "SELECT 1 FROM users WHERE username = ?", (username,)
         ).fetchone()
@@ -483,7 +527,7 @@ def update_user(
     user_id: int, body: UserPatch, user: dict = Depends(require_admin)
 ) -> dict:
     data = body.model_dump(exclude_unset=True)
-    with get_db() as conn:
+    with get_users_db() as conn:
         existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if existing is None:
             raise HTTPException(status_code=404, detail="Utilisateur introuvable")
@@ -531,7 +575,9 @@ def update_user(
         if not actif:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         row = conn.execute(USER_SELECT + " WHERE u.id = ?", (user_id,)).fetchone()
-    return _user_out(row)
+    result = _user_out(row)
+    result["dossier_count"] = _dossier_counts_by_user().get(user_id, 0)
+    return result
 
 
 @app.delete("/api/users/{user_id}")
@@ -540,21 +586,25 @@ def delete_user(user_id: int, user: dict = Depends(require_admin)) -> dict:
         raise HTTPException(
             status_code=400, detail="Vous ne pouvez pas supprimer votre propre compte"
         )
-    with get_db() as conn:
+    with get_users_db() as conn:
         existing = conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone()
         if existing is None:
             raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    # Les dossiers et remarques sont dans l'autre base : on y vérifie les liens.
+    with get_db() as conn:
         linked = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM dossiers WHERE verifier_id = ? AND deleted_at IS NULL) "
+            "SELECT (SELECT COUNT(*) FROM dossiers "
+            "        WHERE verifier_id = ? AND deleted_at IS NULL) "
             "     + (SELECT COUNT(*) FROM remarks WHERE author_id = ?) AS n",
             (user_id, user_id),
         ).fetchone()["n"]
-        if linked:
-            raise HTTPException(
-                status_code=409,
-                detail="Ce compte est lié à des dossiers ou des remarques : "
-                "il ne peut pas être supprimé",
-            )
+    if linked:
+        raise HTTPException(
+            status_code=409,
+            detail="Ce compte est lié à des dossiers ou des remarques : "
+            "il ne peut pas être supprimé",
+        )
+    with get_users_db() as conn:
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
     return {"ok": True}
@@ -633,7 +683,7 @@ def list_dossiers(
         rows = conn.execute(
             DOSSIER_SELECT + where + " ORDER BY d.id DESC", params
         ).fetchall()
-    return [_dossier_out(r) for r in rows]
+    return _dossiers_out(rows)
 
 
 @app.post("/api/dossiers", status_code=201)
@@ -694,7 +744,7 @@ def create_dossier(body: DossierIn, user: dict = Depends(require_write)) -> dict
             conn.execute("ROLLBACK")
             raise
         row = conn.execute(DOSSIER_SELECT + " WHERE d.id = ?", (dossier_id,)).fetchone()
-    return _dossier_out(row)
+    return _dossier_single_out(row)
 
 
 @app.get("/api/dossiers/{dossier_id}")
@@ -710,7 +760,7 @@ def get_dossier(dossier_id: int, user: dict = Depends(current_user)) -> dict:
             "ORDER BY is_mandatory DESC, name",
             (row["type"],),
         ).fetchall()
-    out = _dossier_out(row)
+    out = _dossier_single_out(row)
     out["checkpoints"] = [_checkpoint_out(c) for c in checkpoints]
     return out
 
@@ -786,7 +836,7 @@ def update_dossier(
         row = conn.execute(
             DOSSIER_SELECT + " WHERE d.id = ?", (dossier_id,)
         ).fetchone()
-    return _dossier_out(row)
+    return _dossier_single_out(row)
 
 
 class WithdrawIn(BaseModel):
@@ -847,7 +897,7 @@ def withdraw_dossier(
         )
         _add_remark_text(conn, dossier_id, body.remark, user["id"])
         row = conn.execute(DOSSIER_SELECT + " WHERE d.id = ?", (dossier_id,)).fetchone()
-    return _dossier_out(row)
+    return _dossier_single_out(row)
 
 
 @app.post("/api/dossiers/{dossier_id}/receive")
@@ -864,7 +914,7 @@ def receive_dossier(
         )
         _add_remark_text(conn, dossier_id, body.remark, user["id"])
         row = conn.execute(DOSSIER_SELECT + " WHERE d.id = ?", (dossier_id,)).fetchone()
-    return _dossier_out(row)
+    return _dossier_single_out(row)
 
 
 @app.post("/api/dossiers/{dossier_id}/status")
@@ -881,7 +931,7 @@ def change_dossier_status(
         )
         _add_remark_text(conn, dossier_id, body.remark, user["id"])
         row = conn.execute(DOSSIER_SELECT + " WHERE d.id = ?", (dossier_id,)).fetchone()
-    return _dossier_out(row)
+    return _dossier_single_out(row)
 
 
 @app.delete("/api/dossiers/{dossier_id}")
@@ -918,12 +968,12 @@ def list_remarks(dossier_id: int, user: dict = Depends(current_user)) -> list[di
         ).fetchone() is None:
             raise HTTPException(status_code=404, detail="Dossier introuvable")
         rows = conn.execute(
-            "SELECT r.*, u.display_name AS author_name "
-            "FROM remarks r JOIN users u ON u.id = r.author_id "
+            "SELECT r.* FROM remarks r "
             "WHERE r.dossier_id = ? ORDER BY r.date DESC, r.id DESC",
             (dossier_id,),
         ).fetchall()
-    return [_remark_out(r) for r in rows]
+    noms = _user_names({row["author_id"] for row in rows})
+    return [_remark_out(row, noms.get(row["author_id"], "—")) for row in rows]
 
 
 @app.post("/api/dossiers/{dossier_id}/remarks", status_code=201)
@@ -946,11 +996,11 @@ def add_remark(
         )
         remark_id = cur.lastrowid
         row = conn.execute(
-            "SELECT r.*, u.display_name AS author_name "
-            "FROM remarks r JOIN users u ON u.id = r.author_id WHERE r.id = ?",
-            (remark_id,),
+            "SELECT r.* FROM remarks WHERE r.id = ?", (remark_id,)
         ).fetchone()
-    return _remark_out(row)
+    return _remark_out(
+        row, _user_names({row["author_id"]}).get(row["author_id"], "—")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -969,22 +1019,26 @@ def dashboard(user: dict = Depends(current_user)) -> dict:
             "SELECT COUNT(*) AS n FROM dossiers WHERE deleted_at IS NULL"
         ).fetchone()["n"]
         recent_remarks = conn.execute(
-            "SELECT r.id, r.comment_text, r.date, r.dossier_id, "
-            "d.reference_number, u.display_name AS author_name "
+            "SELECT r.id, r.comment_text, r.date, r.dossier_id, r.author_id, "
+            "d.reference_number "
             "FROM remarks r "
             "JOIN dossiers d ON d.id = r.dossier_id "
-            "JOIN users u ON u.id = r.author_id "
             "WHERE d.deleted_at IS NULL "
             "ORDER BY r.date DESC, r.id DESC LIMIT 8"
         ).fetchall()
         recent_dossiers = conn.execute(
             "SELECT d.id, d.reference_number, d.name, d.type, d.state, d.status, "
-            "d.created_date, d.withdrawal_date, d.withdrawn_by, "
-            "u.display_name AS verifier_name "
-            "FROM dossiers d JOIN users u ON u.id = d.verifier_id "
+            "d.created_date, d.withdrawal_date, d.withdrawn_by, d.verifier_id "
+            "FROM dossiers d "
             "WHERE d.deleted_at IS NULL "
             "ORDER BY d.id DESC LIMIT 8"
         ).fetchall()
+
+    # Noms des comptes concernés, lus dans la base des utilisateurs.
+    noms = _user_names(
+        {row["verifier_id"] for row in recent_dossiers}
+        | {row["author_id"] for row in recent_remarks}
+    )
 
     matrix = {t: {s: 0 for s in DOSSIER_STATUSES} for t in DOSSIER_TYPES}
     for row in count_rows:
@@ -1006,7 +1060,7 @@ def dashboard(user: dict = Depends(current_user)) -> dict:
                 "reference_number": row["reference_number"],
                 "name": row["name"],
                 "text": row["name"],
-                "who": row["verifier_name"],
+                "who": noms.get(row["verifier_id"], "—"),
             }
         )
         if row["withdrawal_date"]:
@@ -1030,7 +1084,7 @@ def dashboard(user: dict = Depends(current_user)) -> dict:
                 "reference_number": row["reference_number"],
                 "name": "",
                 "text": row["comment_text"],
-                "who": row["author_name"],
+                "who": noms.get(row["author_id"], "—"),
             }
         )
     activity.sort(key=lambda item: item["at"], reverse=True)
@@ -1051,7 +1105,7 @@ def dashboard(user: dict = Depends(current_user)) -> dict:
 IMPORT_MAX_BYTES = 512 * 1024 * 1024
 
 #: Tables qu'un fichier importé doit contenir pour être exploitable ici.
-REQUIRED_TABLES = ("users", "dossiers", "checkpoints", "counters", "remarks")
+REQUIRED_TABLES = ("dossiers", "checkpoints", "counters", "remarks")
 
 
 def _data_directory() -> str:
@@ -1077,9 +1131,11 @@ def _replace_database(source: str) -> None:
 
 
 def _database_counts() -> dict:
+    with get_users_db() as uconn:
+        users = uconn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
     with get_db() as conn:
         return {
-            "users": conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"],
+            "users": users,
             "dossiers": conn.execute(
                 "SELECT COUNT(*) AS n FROM dossiers WHERE deleted_at IS NULL"
             ).fetchone()["n"],
@@ -1154,13 +1210,18 @@ def _validate_database_file(chemin: str) -> None:
 
 @app.get("/api/database/info")
 def database_info(user: dict = Depends(current_user)) -> dict:
-    """Emplacement, taille et volumes de la base courante."""
+    """Emplacement, taille et volumes des deux bases."""
     infos = _database_counts()
-    try:
-        infos["size_bytes"] = os.path.getsize(db.DB_PATH)
-    except OSError:
-        infos["size_bytes"] = 0
+    for cle, chemin in (
+        ("size_bytes", db.DB_PATH),
+        ("users_size_bytes", db.USERS_DB_PATH),
+    ):
+        try:
+            infos[cle] = os.path.getsize(chemin)
+        except OSError:
+            infos[cle] = 0
     infos["path"] = db.DB_PATH
+    infos["users_path"] = db.USERS_DB_PATH
     return infos
 
 
@@ -1206,25 +1267,28 @@ async def import_database(
         with os.fdopen(descripteur, "wb") as fichier:
             fichier.write(contenu)
         _validate_database_file(chemin)
+        # La base des comptes n'est jamais remplacée : un ancien export qui en
+        # contient encore se voit retirer ces tables avant d'être installé.
+        db.sanitize_dossiers_file(chemin)
         _replace_database(chemin)
     except Exception:
         if os.path.exists(chemin):
             os.unlink(chemin)
         raise
 
-    # Une base exportée par une version antérieure est mise à niveau, et le
-    # compte administrateur de secours est recréé s'il manque.
+    # Base de dossiers mise à niveau et points de contrôle garantis ; les
+    # comptes et les sessions ne bougent pas.
     db.init_db()
     seed.run()
 
     resultat = _database_counts()
-    resultat.update({"ok": True, "reconnect": True})
+    resultat.update({"ok": True, "reconnect": False})
     return resultat
 
 
 @app.post("/api/database/reset")
 def reset_database(user: dict = Depends(require_admin)) -> dict:
-    """Remet la base dans l'état d'un premier lancement (données effacées)."""
+    """Remet la base des dossiers à zéro ; les comptes sont conservés."""
     dossier = _data_directory()
     descripteur, chemin = tempfile.mkstemp(
         prefix="dossiers-reinit-", suffix=".db", dir=dossier
@@ -1235,7 +1299,7 @@ def reset_database(user: dict = Depends(require_admin)) -> dict:
         # aucune fenêtre pendant laquelle la base serait absente ou incomplète.
         conn = sqlite3.connect(chemin, isolation_level=None)
         try:
-            conn.executescript(db.SCHEMA)
+            conn.executescript(db.DOSSIERS_SCHEMA)
             for dossier_type, rule in NUMBERING_RULES.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO counters (type, last_number) VALUES (?, ?)",
@@ -1249,10 +1313,10 @@ def reset_database(user: dict = Depends(require_admin)) -> dict:
             os.unlink(chemin)
         raise
 
-    seed.run()  # compte admin/admin + catalogue des points de contrôle
+    seed.run()  # catalogue des points de contrôle (les comptes ne changent pas)
 
     resultat = _database_counts()
-    resultat.update({"ok": True, "reconnect": True})
+    resultat.update({"ok": True, "reconnect": False})
     return resultat
 
 
@@ -1278,7 +1342,8 @@ def main() -> None:
     print("=" * 60, flush=True)
     print("  Suivi des dossiers", flush=True)
     print(f"  Ouvrir http://{host}:{port} dans le navigateur", flush=True)
-    print(f"  Base de données : {db.DB_PATH}", flush=True)
+    print(f"  Base des dossiers     : {db.DB_PATH}", flush=True)
+    print(f"  Base des utilisateurs : {db.USERS_DB_PATH}", flush=True)
     print("  Connexion de démonstration : admin / admin", flush=True)
     print("=" * 60, flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")

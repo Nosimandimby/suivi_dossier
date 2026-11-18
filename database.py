@@ -1,8 +1,18 @@
-"""Helpers SQLite, schéma et règles métier de l'application de suivi des dossiers.
+"""Helpers SQLite, schémas et règles métier de l'application de suivi des dossiers.
 
-La base est un simple fichier (data/dossiers.db par défaut), donc la sauvegarde
-consiste à copier ce seul fichier.  Tout l'état, y compris les compteurs de
-numérotation par type, vit dans ce fichier et survit donc aux redémarrages.
+Les données sont réparties en deux bases distinctes, chacune un unique fichier :
+
+- ``data/dossiers.db`` : dossiers, remarques, points de contrôle et compteurs de
+  numérotation.  C'est la seule base exportée, importée et réinitialisée.
+- ``data/utilisateurs.db`` : comptes et sessions.  Elle n'est jamais exportée,
+  importée ni réinitialisée : elle reste stable quel que soit l'état des
+  dossiers, et un import ne déconnecte personne.
+
+Aucune contrainte de clé étrangère ne traverse la frontière entre les deux
+bases : ``dossiers.verifier_id`` et ``remarks.author_id`` sont de simples
+identifiants, dont le nom affiché est résolu par l'application (voir main.py).
+Une ancienne base unique (comptes et dossiers dans ``dossiers.db``) est scindée
+automatiquement au premier lancement de cette version.
 """
 
 from __future__ import annotations
@@ -15,7 +25,13 @@ import chemins
 
 BASE_DIR = chemins.HOME_DIR
 DATA_DIR = chemins.chemin_donnees()
+
+#: Base des dossiers : c'est elle que l'interface exporte, importe et remet à zéro.
 DB_PATH = os.environ.get("DOSSIER_DB_PATH") or os.path.join(DATA_DIR, "dossiers.db")
+#: Base des comptes (utilisateurs + sessions) : jamais exportée ni remplacée.
+USERS_DB_PATH = os.environ.get("UTILISATEURS_DB_PATH") or os.path.join(
+    DATA_DIR, "utilisateurs.db"
+)
 
 # ---------------------------------------------------------------------------
 # Règles métier
@@ -72,24 +88,8 @@ _TYPE_SQL_LIST = ", ".join(f"'{t}'" for t in DOSSIER_TYPES)
 _STATUS_SQL_LIST = ", ".join(f"'{s}'" for s in DOSSIER_STATUSES)
 _STATE_SQL_LIST = ", ".join(f"'{s}'" for s in DOSSIER_STATES)
 
-SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    display_name  TEXT NOT NULL,
-    role          TEXT NOT NULL DEFAULT 'admin',
-    actif         INTEGER NOT NULL DEFAULT 1,
-    created_at    TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    token      TEXT PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
+#: Schéma de la base des dossiers (aucun compte ici).
+DOSSIERS_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS dossiers (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     reference_number   TEXT NOT NULL UNIQUE,
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS dossiers (
     withdrawal_date    TEXT,
     withdrawn_by       TEXT,
     observation        TEXT,
-    verifier_id        INTEGER NOT NULL REFERENCES users(id),
+    verifier_id        INTEGER NOT NULL,
     parent_dossier_id  INTEGER REFERENCES dossiers(id) ON DELETE SET NULL,
     created_at         TEXT,
     updated_at         TEXT,
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS remarks (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     dossier_id   INTEGER NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
     comment_text TEXT NOT NULL,
-    author_id    INTEGER NOT NULL REFERENCES users(id),
+    author_id    INTEGER NOT NULL,
     date         TEXT NOT NULL
 );
 
@@ -140,24 +140,39 @@ CREATE INDEX IF NOT EXISTS idx_remarks_dossier ON remarks(dossier_id);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_type ON checkpoints(applicable_dossier_type);
 """
 
+#: Schéma de la base des comptes.
+USERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'admin',
+    actif         INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+"""
+
 
 # ---------------------------------------------------------------------------
-# Connexion
+# Connexions
 # ---------------------------------------------------------------------------
 
 
 @contextmanager
-def get_db():
-    """Ouvre une connexion courte.
-
-    Le mode autocommit (isolation_level=None) est utilisé : chaque instruction
-    est atomique, et les sections multi-instructions ouvrent une transaction
-    explicite quand nécessaire (voir create_dossier dans main.py).
-    """
-    directory = os.path.dirname(DB_PATH)
+def _open(path: str):
+    """Ouvre une connexion courte sur un fichier de base."""
+    directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=15, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -166,142 +181,55 @@ def get_db():
         conn.close()
 
 
+@contextmanager
+def get_db():
+    """Connexion à la base des dossiers.
+
+    Le mode autocommit (isolation_level=None) est utilisé : chaque instruction
+    est atomique, et les sections multi-instructions ouvrent une transaction
+    explicite quand nécessaire (voir create_dossier dans main.py).
+    """
+    with _open(DB_PATH) as conn:
+        yield conn
+
+
+@contextmanager
+def get_users_db():
+    """Connexion à la base des comptes et des sessions."""
+    with _open(USERS_DB_PATH) as conn:
+        yield conn
+
+
+# ---------------------------------------------------------------------------
+# Outils de migration
+# ---------------------------------------------------------------------------
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Aligne une base existante sur le schéma courant (sans perdre les données)."""
-    user_columns = _columns(conn, "users")
-    if user_columns and ("email" in user_columns or "role" not in user_columns):
-        # Ancienne table avec email : reconstruction à l'identique, les comptes
-        # existants deviennent administrateurs actifs.  Les instructions sont
-        # exécutées une à une : executescript() validerait la transaction
-        # implicitement.
-        conn.execute("PRAGMA foreign_keys = OFF")
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            for statement in (
-                "DROP TABLE IF EXISTS users_new",
-                """
-                CREATE TABLE users_new (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                    password_hash TEXT NOT NULL,
-                    display_name  TEXT NOT NULL,
-                    role          TEXT NOT NULL DEFAULT 'admin',
-                    actif         INTEGER NOT NULL DEFAULT 1,
-                    created_at    TEXT NOT NULL
-                )
-                """,
-                "INSERT INTO users_new (id, username, password_hash, display_name, role, actif, created_at) "
-                "SELECT id, username, password_hash, display_name, 'admin', 1, created_at FROM users",
-                "DROP TABLE users",
-                "ALTER TABLE users_new RENAME TO users",
-            ):
-                conn.execute(statement)
-            conn.execute("COMMIT")
-        except Exception:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            raise
-        finally:
-            conn.execute("PRAGMA foreign_keys = ON")
-        user_columns = _columns(conn, "users")
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
 
-    dossier_columns = _columns(conn, "dossiers")
-    for column, definition in (
-        ("observation", "TEXT"),
-        ("created_at", "TEXT"),
-        ("updated_at", "TEXT"),
-        ("deleted_at", "TEXT"),
-    ):
-        if dossier_columns and column not in dossier_columns:
-            conn.execute(f"ALTER TABLE dossiers ADD COLUMN {column} {definition}")
 
-    # Colonne « state » (état) : l'ancienne contrainte CHECK du statut ne peut
-    # pas être modifiée sur place, la table est donc reconstruite une seule
-    # fois.  Les anciens statuts « Reçu » / « Retiré » deviennent l'état du
-    # dossier, avec le statut « En cours ».
-    if dossier_columns and "state" not in dossier_columns:
-        _rebuild_dossiers(conn)
-
-    # La date de visa devient la date de retrait, et le nom de la personne qui
-    # retire le dossier est conservé.
-    dossier_columns = _columns(conn, "dossiers")
-    if dossier_columns and "withdrawal_date" not in dossier_columns:
-        _rebuild_withdrawal(conn)
-
-    # Le statut « Retour » a été ajouté : la contrainte CHECK, figée dans le
-    # schéma SQLite, impose de reconstruire la table sur les bases existantes.
-    table_sql = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dossiers'"
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
-    if table_sql and table_sql[0] and "'Retour'" not in table_sql[0]:
-        _rebuild_withdrawal(conn)
+    return (row[0] or "") if row else ""
 
-    # Le verdict des remarques a été retiré : seule l'observation libre reste.
-    if "verdict" in _columns(conn, "remarks"):
-        _rebuild_remarks(conn)
+
+def _pick(columns: set[str], name: str, fallback: str = "NULL") -> str:
+    """Expression SQL : la colonne si elle existe, sinon une valeur de repli."""
+    return name if name in columns else fallback
 
 
 def _rebuild_dossiers(conn: sqlite3.Connection) -> None:
-    """Reconstruit `dossiers` avec la colonne state et les nouveaux statuts."""
-    conn.execute("PRAGMA foreign_keys = OFF")
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        for statement in (
-            "DROP TABLE IF EXISTS dossiers_new",
-            f"""
-            CREATE TABLE dossiers_new (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                reference_number   TEXT NOT NULL UNIQUE,
-                name               TEXT NOT NULL,
-                type               TEXT NOT NULL CHECK (type IN ({_TYPE_SQL_LIST})),
-                state              TEXT NOT NULL DEFAULT '{DEFAULT_STATE}'
-                                   CHECK (state IN ({_STATE_SQL_LIST})),
-                status             TEXT NOT NULL DEFAULT '{DEFAULT_STATUS}'
-                                   CHECK (status IN ({_STATUS_SQL_LIST})),
-                created_date       TEXT NOT NULL,
-                withdrawal_date    TEXT,
-                withdrawn_by       TEXT,
-                observation        TEXT,
-                verifier_id        INTEGER NOT NULL REFERENCES users(id),
-                parent_dossier_id  INTEGER REFERENCES dossiers_new(id) ON DELETE SET NULL,
-                created_at         TEXT,
-                updated_at         TEXT,
-                deleted_at         TEXT
-            )
-            """,
-            "INSERT INTO dossiers_new (id, reference_number, name, type, state, status, "
-            "created_date, withdrawal_date, withdrawn_by, observation, verifier_id, "
-            "parent_dossier_id, created_at, updated_at, deleted_at) "
-            "SELECT id, reference_number, name, type, "
-            "CASE WHEN status = 'Retiré' THEN 'Retiré' ELSE 'Reçu' END, "
-            "CASE WHEN status IN ('Visé', 'Rejeté') THEN status ELSE 'En cours' END, "
-            "created_date, validation_date, NULL, observation, verifier_id, "
-            "parent_dossier_id, created_at, updated_at, deleted_at FROM dossiers",
-            "DROP TABLE dossiers",
-            "ALTER TABLE dossiers_new RENAME TO dossiers",
-            "CREATE INDEX IF NOT EXISTS idx_dossiers_type ON dossiers(type)",
-            "CREATE INDEX IF NOT EXISTS idx_dossiers_status ON dossiers(status)",
-            "CREATE INDEX IF NOT EXISTS idx_dossiers_verifier ON dossiers(verifier_id)",
-        ):
-            conn.execute(statement)
-        conn.execute("COMMIT")
-    except Exception:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.execute("PRAGMA foreign_keys = ON")
-
-
-def _rebuild_withdrawal(conn: sqlite3.Connection) -> None:
-    """Reconstruit `dossiers` avec le schéma courant (colonnes et CHECK à jour).
-
-    Utilisée pour la date de retrait comme pour l'ajout d'un nouveau statut.
-    """
+    """Reconstruit `dossiers` avec le schéma courant (sans référence aux comptes)."""
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -311,7 +239,38 @@ def _rebuild_withdrawal(conn: sqlite3.Connection) -> None:
             if "withdrawal_date" in columns
             else "validation_date" if "validation_date" in columns else "NULL"
         )
-        name_expr = "withdrawn_by" if "withdrawn_by" in columns else "NULL"
+        name_expr = _pick(columns, "withdrawn_by")
+        # Avant la colonne « state », les anciens statuts « Reçu » / « Retiré »
+        # décrivent la présence physique : ils deviennent l'état du dossier.
+        state_expr = (
+            "state"
+            if "state" in columns
+            else "CASE WHEN status = 'Retiré' THEN 'Retiré' ELSE 'Reçu' END"
+        )
+        status_expr = (
+            "status"
+            if "state" in columns
+            else "CASE WHEN status IN ('Visé', 'Rejeté') THEN status ELSE 'En cours' END"
+        )
+        select = ", ".join(
+            [
+                _pick(columns, "id"),
+                _pick(columns, "reference_number"),
+                _pick(columns, "name", "''"),
+                _pick(columns, "type", "'Autres'"),
+                state_expr,
+                status_expr,
+                _pick(columns, "created_date", "date('now')"),
+                date_expr,
+                name_expr,
+                _pick(columns, "observation"),
+                _pick(columns, "verifier_id", "1"),
+                _pick(columns, "parent_dossier_id"),
+                _pick(columns, "created_at"),
+                _pick(columns, "updated_at"),
+                _pick(columns, "deleted_at"),
+            ]
+        )
         for statement in (
             "DROP TABLE IF EXISTS dossiers_new",
             f"""
@@ -328,7 +287,7 @@ def _rebuild_withdrawal(conn: sqlite3.Connection) -> None:
                 withdrawal_date    TEXT,
                 withdrawn_by       TEXT,
                 observation        TEXT,
-                verifier_id        INTEGER NOT NULL REFERENCES users(id),
+                verifier_id        INTEGER NOT NULL,
                 parent_dossier_id  INTEGER REFERENCES dossiers_new(id) ON DELETE SET NULL,
                 created_at         TEXT,
                 updated_at         TEXT,
@@ -338,9 +297,7 @@ def _rebuild_withdrawal(conn: sqlite3.Connection) -> None:
             "INSERT INTO dossiers_new (id, reference_number, name, type, state, status, "
             "created_date, withdrawal_date, withdrawn_by, observation, verifier_id, "
             "parent_dossier_id, created_at, updated_at, deleted_at) "
-            "SELECT id, reference_number, name, type, state, status, created_date, "
-            f"{date_expr}, {name_expr}, observation, verifier_id, "
-            "parent_dossier_id, created_at, updated_at, deleted_at FROM dossiers",
+            f"SELECT {select} FROM dossiers",
             "DROP TABLE dossiers",
             "ALTER TABLE dossiers_new RENAME TO dossiers",
             "CREATE INDEX IF NOT EXISTS idx_dossiers_type ON dossiers(type)",
@@ -358,10 +315,14 @@ def _rebuild_withdrawal(conn: sqlite3.Connection) -> None:
 
 
 def _rebuild_remarks(conn: sqlite3.Connection) -> None:
-    """Reconstruit `remarks` sans la colonne verdict (observation seule)."""
+    """Reconstruit `remarks` sans la colonne verdict ni référence aux comptes."""
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         conn.execute("BEGIN IMMEDIATE")
+        columns = _columns(conn, "remarks")
+        texte_expr = _pick(columns, "comment_text", "''")
+        auteur_expr = _pick(columns, "author_id", "1")
+        date_expr = _pick(columns, "date", "''")
         for statement in (
             "DROP TABLE IF EXISTS remarks_new",
             """
@@ -369,12 +330,14 @@ def _rebuild_remarks(conn: sqlite3.Connection) -> None:
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 dossier_id   INTEGER NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
                 comment_text TEXT NOT NULL,
-                author_id    INTEGER NOT NULL REFERENCES users(id),
+                author_id    INTEGER NOT NULL,
                 date         TEXT NOT NULL
             )
             """,
             "INSERT INTO remarks_new (id, dossier_id, comment_text, author_id, date) "
-            "SELECT id, dossier_id, comment_text, author_id, date FROM remarks",
+            f"SELECT {_pick(columns, 'id')}, {_pick(columns, 'dossier_id')}, "
+            f"{texte_expr}, {auteur_expr}, {date_expr} "
+            "FROM remarks",
             "DROP TABLE remarks",
             "ALTER TABLE remarks_new RENAME TO remarks",
             "CREATE INDEX IF NOT EXISTS idx_remarks_dossier ON remarks(dossier_id)",
@@ -389,16 +352,130 @@ def _rebuild_remarks(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _migrate_dossiers(conn: sqlite3.Connection) -> None:
+    """Aligne une base de dossiers existante sur le schéma courant."""
+    original = _columns(conn, "dossiers")
+    if not original:
+        return  # base neuve : le schéma est créé plus loin
+
+    for column, definition in (
+        ("observation", "TEXT"),
+        ("created_at", "TEXT"),
+        ("updated_at", "TEXT"),
+        ("deleted_at", "TEXT"),
+    ):
+        if column not in original:
+            conn.execute(f"ALTER TABLE dossiers ADD COLUMN {column} {definition}")
+
+    sql = _table_sql(conn, "dossiers")
+    if (
+        "state" not in original
+        or "withdrawal_date" not in original
+        or "'Retour'" not in sql
+        or "REFERENCES users" in sql
+    ):
+        _rebuild_dossiers(conn)
+
+    if "verdict" in _columns(conn, "remarks"):
+        _rebuild_remarks(conn)
+
+
+def _drop_user_tables(conn: sqlite3.Connection) -> None:
+    """Retire les tables de comptes de la base des dossiers."""
+    tables = _tables(conn)
+    if "users" not in tables and "sessions" not in tables:
+        return
+    # Les dossiers ne doivent plus dépendre de la table des comptes.
+    if "REFERENCES users" in _table_sql(conn, "dossiers"):
+        _rebuild_dossiers(conn)
+    if "remarks" in tables and "REFERENCES users" in _table_sql(conn, "remarks"):
+        _rebuild_remarks(conn)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DROP TABLE IF EXISTS sessions")
+        conn.execute("DROP TABLE IF EXISTS users")
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _copy_legacy_users(conn: sqlite3.Connection) -> None:
+    """Recopie comptes et sessions d'une ancienne base unique vers leur base."""
+    if "users" not in _tables(conn):
+        return
+    columns = _columns(conn, "users")
+    role = "COALESCE(role, 'admin')" if "role" in columns else "'admin'"
+    actif = "COALESCE(actif, 1)" if "actif" in columns else "1"
+    created = "COALESCE(created_at, '')" if "created_at" in columns else "''"
+    users = conn.execute(
+        "SELECT id, username, password_hash, display_name, "
+        f"{role}, {actif}, {created} FROM users"
+    ).fetchall()
+    sessions = (
+        conn.execute(
+            "SELECT token, user_id, created_at, expires_at FROM sessions"
+        ).fetchall()
+        if "sessions" in _tables(conn)
+        else []
+    )
+    with get_users_db() as uconn:
+        uconn.executescript(USERS_SCHEMA)
+        for row in users:
+            uconn.execute(
+                "INSERT OR IGNORE INTO users "
+                "(id, username, password_hash, display_name, role, actif, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                tuple(row),
+            )
+        for row in sessions:
+            uconn.execute(
+                "INSERT OR IGNORE INTO sessions "
+                "(token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                tuple(row),
+            )
+
+
+def sanitize_dossiers_file(path: str) -> None:
+    """Prépare un fichier de dossiers importé : aucun compte n'y est conservé.
+
+    Utile pour les sauvegardes faites avant la séparation des deux bases, qui
+    contenaient encore les comptes : ils sont retirés du fichier, jamais
+    importés, pour que la base des utilisateurs reste stable.
+    """
+    conn = sqlite3.connect(path, timeout=15, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _drop_user_tables(conn)
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    """Crée les tables et les compteurs par type s'ils n'existent pas."""
+    """Crée les deux bases, leurs tables, les compteurs, et scinde une base unique."""
+    with get_users_db() as uconn:
+        uconn.executescript(USERS_SCHEMA)
     with get_db() as conn:
-        conn.executescript(SCHEMA)
-        _migrate(conn)
+        _migrate_dossiers(conn)
+        # Ancienne base unique : les comptes partent dans leur propre fichier,
+        # puis sont retirés de la base des dossiers (donc des exports).
+        _copy_legacy_users(conn)
+        _drop_user_tables(conn)
+        conn.executescript(DOSSIERS_SCHEMA)
         for dossier_type, rule in NUMBERING_RULES.items():
             conn.execute(
                 "INSERT OR IGNORE INTO counters(type, last_number) VALUES (?, ?)",
                 (dossier_type, int(rule["start"]) - 1),
             )
+
+
+# ---------------------------------------------------------------------------
+# Numérotation
+# ---------------------------------------------------------------------------
 
 
 def _range_end(dossier_type: str) -> int | None:

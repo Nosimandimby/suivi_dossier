@@ -229,9 +229,13 @@ def hash_password(password: str, salt: str | None = None) -> str:
 
 
 def run() -> None:
-    """Insère les comptes de démonstration et le catalogue de contrôles."""
+    """Insère les comptes de démonstration et le catalogue de contrôles.
+
+    Les comptes vont dans la base des utilisateurs, les points de contrôle dans
+    celle des dossiers : ce sont deux fichiers distincts.
+    """
     created_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-    with db.get_db() as conn:
+    with db.get_users_db() as conn:
         for username, password, display_name, role, actif in SEED_USERS:
             conn.execute(
                 "INSERT OR IGNORE INTO users "
@@ -246,6 +250,7 @@ def run() -> None:
                     created_at,
                 ),
             )
+    with db.get_db() as conn:
         for name, description, applicable_type, is_mandatory in SEED_CHECKPOINTS:
             conn.execute(
                 "INSERT OR IGNORE INTO checkpoints "
@@ -258,7 +263,8 @@ def run() -> None:
 if __name__ == "__main__":
     db.init_db()
     run()
-    with db.get_db() as conn:
+    with db.get_users_db() as conn:
         users = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    with db.get_db() as conn:
         points = conn.execute("SELECT COUNT(*) AS n FROM checkpoints").fetchone()["n"]
     print(f"Peuplement terminé : {users} utilisateur(s), {points} points de contrôle -> {db.DB_PATH}")

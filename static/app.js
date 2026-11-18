@@ -1534,7 +1534,7 @@ async function renderData() {
       <div class="page-head"><h1>Données</h1></div>
 
       <section class="card">
-        <h2>Base actuelle</h2>
+        <h2>Base des dossiers</h2>
         <div class="grid">
           <div>
             <span class="field-label">Fichier</span>
@@ -1549,10 +1549,6 @@ async function renderData() {
             <span class="field-value">${info.dossiers}</span>
           </div>
           <div>
-            <span class="field-label">Utilisateurs</span>
-            <span class="field-value">${info.users}</span>
-          </div>
-          <div>
             <span class="field-label">Remarques</span>
             <span class="field-value">${info.remarks}</span>
           </div>
@@ -1564,8 +1560,27 @@ async function renderData() {
       </section>
 
       <section class="card">
+        <h2>Base des utilisateurs</h2>
+        <p class="muted">Les comptes et les sessions ont leur propre fichier. Il n'est ni exporté, ni importé, ni réinitialisé : il reste stable.</p>
+        <div class="grid">
+          <div>
+            <span class="field-label">Fichier</span>
+            <span class="field-value small" style="word-break:break-all;">${esc(info.users_path)}</span>
+          </div>
+          <div>
+            <span class="field-label">Taille</span>
+            <span class="field-value">${esc(fmtSize(info.users_size_bytes))}</span>
+          </div>
+          <div>
+            <span class="field-label">Utilisateurs</span>
+            <span class="field-value">${info.users}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
         <h2>Exporter</h2>
-        <p class="muted">Télécharge une copie complète de la base (dossiers, remarques, utilisateurs, compteurs) dans un fichier <code>.db</code>. Conservez ce fichier : c'est votre sauvegarde.</p>
+        <p class="muted">Télécharge une copie de la base des dossiers (dossiers, remarques, points de contrôle, compteurs) dans un fichier <code>.db</code>. Les comptes utilisateurs n'en font pas partie. Conservez ce fichier : c'est votre sauvegarde.</p>
         <div class="form-actions" style="justify-content:flex-start;">
           <button class="btn btn-primary" id="export-btn" type="button">Télécharger la base (.db)</button>
         </div>
@@ -1574,26 +1589,28 @@ async function renderData() {
 
       <section class="card" ${canWrite() ? "" : "hidden"}>
         <h2>Importer</h2>
-        <p class="muted">Restaure un fichier <code>.db</code> exporté depuis cette application. Toutes les données actuelles sont remplacées : exportez d'abord la base actuelle si vous voulez pouvoir revenir en arrière.</p>
+        <p class="muted">Restaure un fichier <code>.db</code> de la base des dossiers. Les dossiers, remarques et compteurs actuels sont remplacés ; exportez-les d'abord si vous voulez pouvoir revenir en arrière.</p>
         <div class="field">
           <label for="import-file">Fichier de sauvegarde (.db)</label>
           <input id="import-file" type="file" accept=".db,.sqlite,.sqlite3">
         </div>
         <div class="error" id="import-error" hidden></div>
+        <div class="notice" id="import-ok" hidden></div>
         <div class="form-actions" style="justify-content:flex-start;">
           <button class="btn btn-primary" id="import-btn" type="button">Importer et remplacer</button>
         </div>
-        <p class="hint">Après l'import, la session est fermée : reconnectez-vous avec un compte présent dans la base importée.</p>
+        <p class="hint">Les comptes utilisateurs ne sont pas touchés et personne n'est déconnecté.</p>
       </section>
 
       <section class="card" ${isAdmin() ? "" : "hidden"}>
         <h2>Réinitialiser</h2>
-        <p class="muted">Efface définitivement tous les dossiers, remarques, comptes et compteurs, puis recrée une base neuve avec le compte <code>admin</code> / <code>admin</code> et les points de contrôle.</p>
+        <p class="muted">Efface définitivement dossiers, remarques et compteurs, puis recrée une base des dossiers neuve avec les points de contrôle. Les comptes utilisateurs sont conservés.</p>
         <div class="field">
           <label for="reset-confirm">Tapez <code>REINITIALISER</code> pour confirmer</label>
           <input id="reset-confirm" autocomplete="off" placeholder="REINITIALISER">
         </div>
         <div class="error" id="reset-error" hidden></div>
+        <div class="notice" id="reset-ok" hidden></div>
         <div class="form-actions" style="justify-content:flex-start;">
           <button class="btn btn-danger" id="reset-btn" type="button" disabled>Réinitialiser la base</button>
         </div>
@@ -1607,6 +1624,7 @@ async function renderData() {
     const importInput = document.getElementById("import-file");
     const importBtn = document.getElementById("import-btn");
     const importError = document.getElementById("import-error");
+    const importOk = document.getElementById("import-ok");
     importBtn.addEventListener("click", async () => {
       importError.hidden = true;
       const fichier = importInput.files && importInput.files[0];
@@ -1622,14 +1640,14 @@ async function renderData() {
       )
         return;
       importBtn.disabled = true;
+      importOk.hidden = true;
       try {
         const data = await uploadDatabase(fichier);
-        clearSession();
-        renderLogin(
-          `Base importée : ${data.dossiers} dossier(s), ${data.users} utilisateur(s). ` +
-            "Reconnectez-vous avec un compte présent dans cette base.",
-          "notice"
-        );
+        importOk.textContent =
+          `Base des dossiers importée : ${data.dossiers} dossier(s), ` +
+          `${data.remarks} remarque(s). Les comptes utilisateurs sont inchangés.`;
+        importOk.hidden = false;
+        importBtn.disabled = false;
       } catch (err) {
         if (err.message === "Session expirée") {
           clearSession();
@@ -1646,6 +1664,7 @@ async function renderData() {
     const resetInput = document.getElementById("reset-confirm");
     const resetBtn = document.getElementById("reset-btn");
     const resetError = document.getElementById("reset-error");
+    const resetOk = document.getElementById("reset-ok");
     resetInput.addEventListener("input", () => {
       resetBtn.disabled = resetInput.value.trim().toUpperCase() !== "REINITIALISER";
     });
@@ -1658,14 +1677,15 @@ async function renderData() {
       )
         return;
       resetError.hidden = true;
+      resetOk.hidden = true;
       resetBtn.disabled = true;
       try {
         await api("/api/database/reset", { method: "POST", body: {} });
-        clearSession();
-        renderLogin(
-          "Base réinitialisée. Connectez-vous avec le compte par défaut admin / admin.",
-          "notice"
-        );
+        resetInput.value = "";
+        resetOk.textContent =
+          "Base des dossiers réinitialisée : aucun dossier, aucun compteur, " +
+          "points de contrôle recréés. Les comptes utilisateurs sont conservés.";
+        resetOk.hidden = false;
       } catch (err) {
         if (err.message === "Session expirée") return;
         resetError.textContent = err.message;
