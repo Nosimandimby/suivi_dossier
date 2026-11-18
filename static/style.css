@@ -391,3 +391,7 @@ textarea { min-height: 84px; resize: vertical; }
 .action-panel textarea { min-height: 72px; }
 
 .field-value .btn-sm { margin-left: 10px; vertical-align: middle; }
+
+/* ---------- Mise à jour : liste des commits à installer ---------- */
+.update-commits { margin: 10px 0 0; padding-left: 20px; }
+.update-commits li { margin: 4px 0; }

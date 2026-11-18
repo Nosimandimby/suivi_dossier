@@ -11,8 +11,12 @@ import hmac
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import threading
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
@@ -1321,6 +1325,338 @@ def reset_database(user: dict = Depends(require_admin)) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Mise à jour de l'application (Git, depuis l'interface)
+# ---------------------------------------------------------------------------
+#
+# Ces routes remplacent le « git pull » en ligne de commande : elles sont
+# réservées à l'administrateur et n'agissent que sur le dossier de
+# l'application (BASE_DIR).  Aucun chemin ne vient du client : le dépôt, la
+# branche et la branche distante sont déterminés par Git lui-même.
+
+#: Durée maximale d'une opération Git (réseau compris).
+GIT_TIMEOUT = 180
+
+#: Laisse le temps à la réponse HTTP de partir avant de remplacer le processus.
+DELAI_REDEMARRAGE = 1.5
+
+# Adresse réellement utilisée au démarrage, reprise telle quelle au redémarrage.
+_host_effectif: str | None = None
+_port_effectif: int | None = None
+
+_redemarrage_verrou = threading.Lock()
+_redemarrage_planifie = False
+
+
+def _git(*arguments: str, timeout: int = GIT_TIMEOUT) -> subprocess.CompletedProcess:
+    """Exécute Git dans le dossier de l'application, sans interaction possible."""
+    environnement = os.environ.copy()
+    environnement.update(
+        {
+            # Une demande d'identifiant ou de mot de passe ferait attendre la
+            # requête jusqu'au délai maximum : on échoue franchement à la place.
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "",
+            "GIT_SSH_COMMAND": environnement.get(
+                "GIT_SSH_COMMAND", "ssh -o BatchMode=yes"
+            ),
+            "LC_ALL": "C",
+        }
+    )
+    return subprocess.run(
+        ["git", "-C", BASE_DIR, *arguments],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=environnement,
+        cwd=BASE_DIR,
+    )
+
+
+def _git_lancer(*arguments: str, timeout: int = GIT_TIMEOUT) -> subprocess.CompletedProcess:
+    """Comme _git(), mais traduit les échecs système en erreurs HTTP."""
+    try:
+        return _git(*arguments, timeout=timeout)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=400, detail="Git n'est pas installé sur cette machine."
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Opération Git interrompue : délai dépassé (réseau ou dépôt "
+            "distant indisponible).",
+        )
+
+
+def _git_sortie(resultat: subprocess.CompletedProcess) -> str:
+    """Sortie de Git (stdout puis stderr), utilisable telle quelle dans un message."""
+    return ((resultat.stdout or "") + (resultat.stderr or "")).strip()
+
+
+def _git_commit(revision: str = "HEAD") -> dict | None:
+    """Commit d'une révision : identifiant, forme courte, sujet et date."""
+    resultat = _git("log", "-1", "--format=%H%x00%h%x00%s%x00%cI", revision)
+    if resultat.returncode != 0 or not resultat.stdout.strip():
+        return None
+    morceaux = (resultat.stdout.rstrip("\n").split("\x00") + ["", "", "", ""])[:4]
+    return {
+        "hash": morceaux[0],
+        "short": morceaux[1],
+        "subject": morceaux[2],
+        "date": morceaux[3],
+    }
+
+
+def _git_fichiers_modifies() -> list[str]:
+    """Fichiers suivis par Git et modifiés localement (hors fichiers ignorés)."""
+    resultat = _git("status", "--porcelain", "--untracked-files=no")
+    if resultat.returncode != 0:
+        return []
+    fichiers = []
+    for ligne in resultat.stdout.splitlines():
+        nom = ligne[3:].strip()
+        if " -> " in nom:  # renommage : seul le nouveau nom compte
+            nom = nom.split(" -> ", 1)[1]
+        if nom:
+            fichiers.append(nom)
+    return fichiers
+
+
+def _git_ecart(suivi: str) -> tuple[int, int]:
+    """(commits en avance, commits en retard) par rapport à la branche distante."""
+    resultat = _git("rev-list", "--left-right", "--count", f"HEAD...{suivi}")
+    if resultat.returncode != 0:
+        return 0, 0
+    morceaux = resultat.stdout.split()
+    if len(morceaux) != 2:
+        return 0, 0
+    try:
+        return int(morceaux[0]), int(morceaux[1])
+    except ValueError:
+        return 0, 0
+
+
+def _git_commits_entrants(suivi: str, limite: int = 15) -> list[dict]:
+    """Commits présents sur la branche distante mais pas encore installés."""
+    resultat = _git(
+        "log", f"--max-count={int(limite)}", "--format=%h%x00%s%x00%cI", f"HEAD..{suivi}"
+    )
+    if resultat.returncode != 0:
+        return []
+    commits = []
+    for ligne in resultat.stdout.splitlines():
+        morceaux = (ligne.split("\x00") + ["", "", ""])[:3]
+        if morceaux[0]:
+            commits.append(
+                {"short": morceaux[0], "subject": morceaux[1], "date": morceaux[2]}
+            )
+    return commits
+
+
+def _etat_mise_a_jour() -> dict:
+    """Décrit l'installation locale : dépôt, branche et commit installés.
+
+    Aucun accès réseau : la vérification des nouveautés est une action séparée.
+    """
+    etat: dict = {
+        "supported": False,
+        "reason": "",
+        "version": app.version,
+        "branch": None,
+        "upstream": None,
+        "remote": None,
+        "commit": None,
+        "dirty": False,
+        "dirty_files": [],
+        "checked": False,
+        "ahead": 0,
+        "behind": 0,
+        "update_available": False,
+        "commits": [],
+        "can_restart": not getattr(sys, "frozen", False),
+        "restart_pending": _redemarrage_planifie,
+    }
+
+    if getattr(sys, "frozen", False):
+        etat["reason"] = (
+            "Cette installation est un exécutable autonome : la mise à jour se "
+            "fait en remplaçant le fichier de l'application."
+        )
+        return etat
+    if shutil.which("git") is None:
+        etat["reason"] = "Git n'est pas installé sur cette machine."
+        return etat
+    if not os.path.isdir(os.path.join(BASE_DIR, ".git")):
+        etat["reason"] = (
+            "Cette installation n'est pas un dépôt Git (copie manuelle ou add-on "
+            "Home Assistant) : réinstallez l'application pour la mettre à jour."
+        )
+        return etat
+    if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        etat["reason"] = "Le dossier de l'application n'est pas un dépôt Git exploitable."
+        return etat
+
+    branche = _git("rev-parse", "--abbrev-ref", "HEAD")
+    suivi = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    remote = _git("remote", "get-url", "origin")
+
+    etat["branch"] = branche.stdout.strip() if branche.returncode == 0 else None
+    etat["upstream"] = suivi.stdout.strip() if suivi.returncode == 0 else None
+    etat["remote"] = remote.stdout.strip() if remote.returncode == 0 else None
+    etat["commit"] = _git_commit()
+    etat["dirty_files"] = _git_fichiers_modifies()
+    etat["dirty"] = bool(etat["dirty_files"])
+
+    if not etat["upstream"]:
+        etat["reason"] = (
+            "La branche « " + str(etat["branch"] or "courante") + " » ne suit aucune "
+            "branche distante : associez-la une fois avec "
+            "git branch --set-upstream-to=origin/" + str(etat["branch"] or "main") + "."
+        )
+        return etat
+
+    etat["supported"] = True
+    return etat
+
+
+@app.get("/api/update/info")
+def update_info(user: dict = Depends(current_user)) -> dict:
+    """Version installée, dépôt, branche et commit (sans accès réseau)."""
+    return _etat_mise_a_jour()
+
+
+@app.post("/api/update/check")
+def update_check(user: dict = Depends(require_admin)) -> dict:
+    """Interroge le dépôt distant et indique les commits non installés."""
+    etat = _etat_mise_a_jour()
+    if not etat["supported"]:
+        raise HTTPException(status_code=400, detail=etat["reason"])
+
+    recuperation = _git_lancer("fetch", "--prune", "origin")
+    if recuperation.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail="Récupération impossible : "
+            + (_git_sortie(recuperation) or "le dépôt distant n'a pas répondu."),
+        )
+
+    suivi = etat["upstream"]
+    en_avance, en_retard = _git_ecart(suivi)
+    etat.update(
+        {
+            "checked": True,
+            "ahead": en_avance,
+            "behind": en_retard,
+            "update_available": en_retard > 0,
+            "commits": _git_commits_entrants(suivi) if en_retard > 0 else [],
+            "commit": _git_commit(),
+        }
+    )
+    return etat
+
+
+@app.post("/api/update/apply")
+def update_apply(user: dict = Depends(require_admin)) -> dict:
+    """Installe les nouveautés : « git pull --ff-only » dans le dossier de l'app.
+
+    La mise à jour est volontairement limitée à une avance rapide : aucune fusion
+    ni commit n'est créé sur la machine, et un conflit échoue sans rien écraser.
+    """
+    etat = _etat_mise_a_jour()
+    if not etat["supported"]:
+        raise HTTPException(status_code=400, detail=etat["reason"])
+
+    avant = etat["commit"]
+    resultat = _git_lancer("pull", "--ff-only")
+    if resultat.returncode != 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Mise à jour impossible : "
+            + (_git_sortie(resultat) or "Git a refusé l'opération."),
+        )
+
+    apres = _git_commit() or avant
+    installe = bool(avant and apres and avant["hash"] != apres["hash"])
+    fichiers: list[str] = []
+    if installe and avant:
+        diff = _git("diff", "--name-only", f"{avant['hash']}..{apres['hash']}")
+        fichiers = [ligne.strip() for ligne in diff.stdout.splitlines() if ligne.strip()]
+
+    # Les dépendances ne s'installent pas seules : on le signale pour que le
+    # lanceur soit relancé avec --reinstall.
+    dependances = [
+        f
+        for f in fichiers
+        if os.path.basename(f).startswith("requirements") and f.endswith(".txt")
+    ]
+
+    return {
+        "ok": True,
+        "updated": installe,
+        "before": avant,
+        "after": apres,
+        "files": fichiers,
+        "deps_changed": bool(dependances),
+        "deps_files": dependances,
+        "restart_required": installe,
+        "can_restart": not getattr(sys, "frozen", False),
+        "branch": etat["branch"],
+        "upstream": etat["upstream"],
+        "output": _git_sortie(resultat),
+    }
+
+
+def _redemarrer_processus() -> None:
+    """Remplace le processus courant par une application à jour (os.exec*).
+
+    Le port se libère avec l'ancien processus et le nouveau code démarre sur la
+    même adresse.  En cas d'échec, l'ancienne version continue de servir : rien
+    n'est interrompu.
+    """
+    global _redemarrage_planifie
+
+    environnement = os.environ.copy()
+    if _host_effectif:
+        environnement["HOST"] = str(_host_effectif)
+    if _port_effectif:
+        environnement["PORT"] = str(_port_effectif)
+
+    try:
+        os.chdir(BASE_DIR)
+        os.execve(
+            sys.executable,
+            [sys.executable, os.path.join(BASE_DIR, "main.py")],
+            environnement,
+        )
+    except Exception as erreur:  # noqa: BLE001 - le serveur actuel doit rester en vie
+        print(f"[mise à jour] redémarrage impossible : {erreur}", flush=True)
+        with _redemarrage_verrou:
+            _redemarrage_planifie = False
+
+
+@app.post("/api/update/restart")
+def update_restart(user: dict = Depends(require_admin)) -> dict:
+    """Redémarre l'application pour charger le code fraîchement récupéré."""
+    global _redemarrage_planifie
+
+    if getattr(sys, "frozen", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Un exécutable autonome se redémarre en le fermant puis en le "
+            "relançant.",
+        )
+    with _redemarrage_verrou:
+        if _redemarrage_planifie:
+            return {"ok": True, "scheduled": True}
+        _redemarrage_planifie = True
+
+    minuteur = threading.Timer(DELAI_REDEMARRAGE, _redemarrer_processus)
+    minuteur.daemon = True
+    minuteur.start()
+    return {"ok": True, "scheduled": True, "delay": DELAI_REDEMARRAGE}
+
+
+# ---------------------------------------------------------------------------
 # Point d'entrée
 # ---------------------------------------------------------------------------
 
@@ -1337,8 +1673,12 @@ def _env_port() -> int:
 def main() -> None:
     import uvicorn
 
+    global _host_effectif, _port_effectif
+
     host = os.environ.get("HOST") or "0.0.0.0"
     port = _env_port()
+    # Retenus pour redémarrer sur la même adresse depuis l'interface.
+    _host_effectif, _port_effectif = host, port
     print("=" * 60, flush=True)
     print("  Suivi des dossiers", flush=True)
     print(f"  Ouvrir http://{host}:{port} dans le navigateur", flush=True)

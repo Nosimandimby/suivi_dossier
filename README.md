@@ -72,7 +72,21 @@ Un `.exe` ne peut être produit que depuis Windows. Sur la machine Windows (avec
 
 ---
 
-## 🔄 Mise à jour de l'application (Workflow Git)
+## 🔄 Mise à jour de l'application
+
+### Depuis l'interface (recommandé)
+
+L'administrateur ouvre l'onglet **Mise à jour** : il y voit la version installée
+(commit, branche, dépôt), peut **vérifier** les nouveautés puis les **installer**
+(`git pull` est exécuté dans le dossier de l'application), et enfin **redémarrer**
+l'application pour charger le nouveau code. Aucun terminal n'est nécessaire.
+
+La mise à jour est limitée à une avance rapide : aucune fusion n'est créée sur la
+machine de production, et un conflit échoue sans rien modifier. Cette page est
+indisponible pour une copie manuelle (sans `.git`), pour un exécutable autonome
+et pour l'add-on Home Assistant.
+
+### En ligne de commande (secours)
 
 Lorsque vous modifiez le code sur votre machine de développement et que vous poussez sur GitHub :
 

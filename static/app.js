@@ -241,6 +241,8 @@ function showAppChrome() {
      aucun dossier. */
   const usersNav = document.querySelector('.main-nav a[data-nav="users"]');
   if (usersNav) usersNav.style.display = isAdmin() ? "" : "none";
+  const updateNav = document.querySelector('.main-nav a[data-nav="update"]');
+  if (updateNav) updateNav.style.display = isAdmin() ? "" : "none";
   const newNav = document.querySelector('.main-nav a[data-nav="new"]');
   if (newNav) newNav.style.display = canWrite() ? "" : "none";
 }
@@ -1700,6 +1702,254 @@ async function renderData() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Mise à jour de l'application (Git, depuis l'interface)             */
+/* ------------------------------------------------------------------ */
+
+/* Liste des commits qui seront installés par la mise à jour. */
+function commitsHtml(commits) {
+  if (!commits || !commits.length) return "";
+  return `<ul class="update-commits">${commits
+    .map(
+      (c) =>
+        `<li><code>${esc(c.short)}</code> ${esc(c.subject)} ` +
+        `<span class="muted small">${esc(fmtDate(c.date))}</span></li>`
+    )
+    .join("")}</ul>`;
+}
+
+async function renderUpdate() {
+  setActiveNav("update");
+  closePopovers();
+  const app = document.getElementById("app");
+  app.innerHTML =
+    `<div class="page-head"><h1>Mise à jour</h1></div><p class="muted">Chargement…</p>`;
+
+  let info;
+  try {
+    info = await api("/api/update/info");
+  } catch (err) {
+    if (err.message === "Session expirée") return;
+    renderError(err);
+    return;
+  }
+
+  const admin = isAdmin();
+  const commit = info.commit;
+  const modifs = info.dirty_files || [];
+
+  /* Vérification et installation : uniquement pour l'administrateur, et
+     seulement quand l'installation est un dépôt Git exploitable. */
+  const carteVerification =
+    admin && info.supported
+      ? `<section class="card">
+          <h2>Vérifier</h2>
+          <p class="muted">Interroge le dépôt distant. Rien n'est modifié à cette étape.</p>
+          <div class="form-actions" style="justify-content:flex-start;">
+            <button class="btn btn-primary" id="update-check-btn" type="button">Vérifier les mises à jour</button>
+          </div>
+          <div class="notice" id="update-check-ok" hidden></div>
+          <div class="error" id="update-check-error" hidden></div>
+        </section>`
+      : "";
+
+  const carteInstallation =
+    admin && info.supported
+      ? `<section class="card">
+          <h2>Installer</h2>
+          <p class="muted">Récupère les nouveautés dans le dossier de l'application, sans fusion ni commit local : un conflit échoue sans rien modifier.</p>
+          <div class="form-actions" style="justify-content:flex-start;">
+            <button class="btn btn-primary" id="update-apply-btn" type="button">Mettre à jour maintenant</button>
+          </div>
+          <div class="notice" id="update-apply-ok" hidden></div>
+          <div class="error" id="update-apply-error" hidden></div>
+        </section>`
+      : "";
+
+  const carteRedemarrage = info.can_restart
+    ? `<section class="card">
+        <h2>Redémarrer l'application</h2>
+        <p class="muted">Le nouveau code n'est pris en compte qu'au redémarrage. La page se recharge d'elle-même dès que le serveur répond.</p>
+        <div class="form-actions" style="justify-content:flex-start;">
+          <button class="btn" id="update-restart-btn" type="button">Redémarrer maintenant</button>
+        </div>
+        <div class="notice" id="update-restart-ok" hidden></div>
+      </section>`
+    : "";
+
+  app.innerHTML = `
+    <div class="page-head"><h1>Mise à jour</h1></div>
+    <p class="muted">Mettez l'application à jour depuis cette page : elle récupère le code du dépôt Git, puis redémarre pour le charger. Aucun terminal n'est nécessaire.</p>
+
+    ${info.supported ? "" : `<div class="notice">Mise à jour depuis l'interface indisponible : ${esc(info.reason)}</div>`}
+
+    <section class="card">
+      <h2>Version installée</h2>
+      <div class="grid">
+        <div>
+          <span class="field-label">Version</span>
+          <span class="field-value">${esc(info.version)}</span>
+        </div>
+        <div>
+          <span class="field-label">Commit installé</span>
+          <span class="field-value small">${commit ? `<code>${esc(commit.short)}</code> ${esc(commit.subject)}` : "—"}</span>
+        </div>
+        <div>
+          <span class="field-label">Date du commit</span>
+          <span class="field-value">${commit ? esc(fmtDate(commit.date)) : "—"}</span>
+        </div>
+        <div>
+          <span class="field-label">Branche</span>
+          <span class="field-value">${esc(info.branch || "—")}</span>
+        </div>
+        <div>
+          <span class="field-label">Branche distante suivie</span>
+          <span class="field-value">${esc(info.upstream || "—")}</span>
+        </div>
+        <div>
+          <span class="field-label">Dépôt</span>
+          <span class="field-value small" style="word-break:break-all;">${esc(info.remote || "—")}</span>
+        </div>
+      </div>
+      ${modifs.length
+        ? `<p class="hint">Fichiers suivis par Git et modifiés localement : ${modifs
+            .map((f) => `<code>${esc(f)}</code>`)
+            .join(", ")}. Git refusera une mise à jour qui les concernerait ; les autres passent.</p>`
+        : ""}
+    </section>
+
+    ${carteVerification}
+    ${carteInstallation}
+    ${carteRedemarrage}`;
+
+  /* --- Vérification ------------------------------------------------- */
+  const checkBtn = document.getElementById("update-check-btn");
+  if (checkBtn) {
+    const ok = document.getElementById("update-check-ok");
+    const errBox = document.getElementById("update-check-error");
+    checkBtn.addEventListener("click", async () => {
+      ok.hidden = true;
+      errBox.hidden = true;
+      checkBtn.disabled = true;
+      checkBtn.textContent = "Vérification…";
+      try {
+        const etat = await api("/api/update/check", { method: "POST" });
+        if (etat.update_available) {
+          ok.innerHTML =
+            `<strong>${etat.behind} commit(s) à installer</strong> depuis ` +
+            `<code>${esc(etat.upstream)}</code>.` +
+            commitsHtml(etat.commits);
+        } else {
+          ok.innerHTML =
+            `Application à jour sur <code>${esc(etat.upstream)}</code>.` +
+            (etat.ahead
+              ? ` ${etat.ahead} commit(s) local(aux) non publié(s).`
+              : "");
+        }
+        ok.hidden = false;
+      } catch (err) {
+        if (err.message === "Session expirée") return;
+        errBox.textContent = err.message;
+        errBox.hidden = false;
+      } finally {
+        checkBtn.disabled = false;
+        checkBtn.textContent = "Vérifier les mises à jour";
+      }
+    });
+  }
+
+  /* --- Installation ------------------------------------------------- */
+  const applyBtn = document.getElementById("update-apply-btn");
+  if (applyBtn) {
+    const ok = document.getElementById("update-apply-ok");
+    const errBox = document.getElementById("update-apply-error");
+    applyBtn.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          "Récupérer et installer la dernière version ? L'application devra " +
+            "être redémarrée ensuite pour la charger."
+        )
+      )
+        return;
+      ok.hidden = true;
+      errBox.hidden = true;
+      applyBtn.disabled = true;
+      applyBtn.textContent = "Mise à jour…";
+      try {
+        const res = await api("/api/update/apply", { method: "POST" });
+        if (!res.updated) {
+          ok.textContent = "Aucune nouveauté : l'application était déjà à jour.";
+        } else {
+          const lignes = [
+            `Commit installé : ${res.after ? res.after.short : "?"} — ` +
+              `${res.after ? res.after.subject : ""}`,
+            res.files.length ? `${res.files.length} fichier(s) mis à jour.` : "",
+            res.deps_changed
+              ? "Les dépendances ont changé : relancez une fois « python3 lancer.py --reinstall » depuis un terminal."
+              : "",
+            res.can_restart
+              ? "Redémarrez l'application ci-dessous pour charger le nouveau code."
+              : "",
+          ];
+          ok.innerHTML =
+            `<strong>Mise à jour installée.</strong><br>` +
+            lignes.filter(Boolean).join("<br>");
+          const restartBtn = document.getElementById("update-restart-btn");
+          if (restartBtn) restartBtn.classList.add("btn-primary");
+        }
+        ok.hidden = false;
+      } catch (err) {
+        if (err.message === "Session expirée") return;
+        errBox.textContent = err.message;
+        errBox.hidden = false;
+      } finally {
+        applyBtn.disabled = false;
+        applyBtn.textContent = "Mettre à jour maintenant";
+      }
+    });
+  }
+
+  /* --- Redémarrage -------------------------------------------------- */
+  const restartBtn = document.getElementById("update-restart-btn");
+  if (restartBtn) {
+    const box = document.getElementById("update-restart-ok");
+    restartBtn.addEventListener("click", async () => {
+      if (!window.confirm("Redémarrer l'application maintenant ?")) return;
+      restartBtn.disabled = true;
+      box.className = "notice";
+      box.textContent =
+        "Redémarrage en cours… la page se recharge dès que l'application répond.";
+      box.hidden = false;
+      try {
+        await api("/api/update/restart", { method: "POST" });
+      } catch (err) {
+        if (err.message === "Session expirée") return;
+        box.className = "error";
+        box.textContent = err.message;
+        restartBtn.disabled = false;
+        return;
+      }
+      /* Le serveur s'arrête puis revient sur la même adresse : on attend qu'il
+         réponde de nouveau avant de recharger la page. */
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      for (let essai = 0; essai < 60; essai++) {
+        try {
+          await api("");
+          location.reload();
+          return;
+        } catch (err) {
+          if (err.message === "Session expirée") return;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+      box.className = "error";
+      box.textContent =
+        "L'application ne répond pas encore. Rechargez cette page dans un instant.";
+      restartBtn.disabled = false;
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Routeur                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1719,6 +1969,10 @@ function route(message) {
   }
   if (parts[0] === "data") {
     renderData();
+    return;
+  }
+  if (parts[0] === "update") {
+    renderUpdate();
     return;
   }
   if (parts[0] !== "dossiers" || parts.length === 0) {
